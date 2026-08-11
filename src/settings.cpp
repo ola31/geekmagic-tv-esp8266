@@ -10,7 +10,12 @@
 #define BOOT_RECOVERY_THRESHOLD 2  // Enter recovery after 2 consecutive early boot failures
 #define POWER_CYCLE_COUNTER_MAGIC 0x5C01  // 5C = "Power Cycle"
 #define POWER_CYCLE_COUNTER_ADDR (BOOT_COUNTER_ADDR + sizeof(BootCounter))
-#define POWER_CYCLE_THRESHOLD 5  // Factory reset after 5 quick power cycles
+// Three quick power cycles drop the device into safe mode, which keeps every
+// setting and just stops running the parts that can misbehave. A settings
+// reset (which now preserves WiFi, see setup()) needs a longer, clearly
+// deliberate run, well clear of the recovery gesture so it is not stumbled into.
+#define POWER_CYCLE_RECOVERY_THRESHOLD 3
+#define POWER_CYCLE_THRESHOLD 10  // Settings reset after 10 quick power cycles
 #define MIN_GMT_OFFSET (-12L * 3600L)
 #define MAX_GMT_OFFSET (14L * 3600L)
 
@@ -525,6 +530,10 @@ void powerCycleCounterReset() {
     EEPROM.commit();
 
     Serial.println(F("Power cycle counter reset"));
+}
+
+bool powerCycleCounterCheckRecovery() {
+    return powerCycleCounterGet() >= POWER_CYCLE_RECOVERY_THRESHOLD;
 }
 
 bool powerCycleCounterCheckReset() {

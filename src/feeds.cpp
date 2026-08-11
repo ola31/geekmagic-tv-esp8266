@@ -18,14 +18,23 @@ namespace {
 
 constexpr uint16_t kWeatherMinRefreshMinutes = 5;
 constexpr uint16_t kWeatherMaxRefreshMinutes = 240;
-constexpr uint16_t kMarketMinRefreshMinutes = 1;
-constexpr uint16_t kMarketMaxRefreshMinutes = 240;
-constexpr uint16_t kHomeAssistantMinRefreshMinutes = 1;
-constexpr uint16_t kHomeAssistantMaxRefreshMinutes = 240;
+// The stations report hourly, so polling faster than every few minutes is waste.
+constexpr uint16_t kRiverMinRefreshMinutes = 5;
+constexpr uint16_t kRiverMaxRefreshMinutes = 240;
+// Anonymous GitHub API access allows 60 requests per hour; keep a safety margin.
+constexpr uint16_t kGithubMinRefreshMinutes = 2;
+constexpr uint16_t kGithubMaxRefreshMinutes = 240;
+// "Seonyu" sits on the Han River mainstream near Seonyudo; the other automatic
+// stations (Tancheon, Jungnangcheon, Anyangcheon) are tributaries.
+constexpr char kRiverDefaultStation[] = "선유";
 constexpr uint32_t kHttpTimeoutMs = 12000;
 constexpr uint32_t kFeedStartupGracePeriodMs = 15000UL;
 constexpr uint32_t kHttpsPreferredFreeHeapBytes = 24000UL;
-constexpr uint32_t kHttpsMinFreeHeapBytes = 15000UL;
+// Heap a TLS request needs on top of its receive buffer: the BearSSL session
+// state, the HTTP client, and the filtered JSON document. The margin is
+// generous because a sync triggered from a web request runs while the server
+// still holds its own buffers, and running out mid-handshake resets the device.
+constexpr uint32_t kHttpsWorkingHeapBytes = 9500UL;
 constexpr uint16_t kHttpsDefaultRecvBufferBytes = 16384;
 constexpr uint16_t kHttpsCompactRecvBufferBytes = 4096;
 constexpr uint16_t kHttpsCompactXmitBufferBytes = 512;
@@ -45,8 +54,6 @@ struct HttpsHostProfile {
 
 struct HttpJsonRequestOptions {
     const char *authorizationBearer;
-    uint8_t tlsMode;
-    const char *fingerprint;
 };
 
 HttpsHostProfile httpsHostProfiles[kHttpsHostProfileCount] = {};
@@ -54,6 +61,34 @@ HttpsHostProfile httpsHostProfiles[kHttpsHostProfileCount] = {};
 bool feedConfigEquals(const FeedConfig &left, const FeedConfig &right);
 void updateDraftState();
 void copyString(char *destination, size_t destinationSize, const char *source);
+
+String trimStringCopy(const char *value) {
+    String normalized = value != nullptr ? String(value) : String("");
+    normalized.trim();
+    return normalized;
+}
+
+String trimmedLowercaseString(const String &value) {
+    String normalized = value;
+    normalized.trim();
+    normalized.toLowerCase();
+    return normalized;
+}
+
+
+uint16_t clampRiverRefresh(uint16_t minutes);
+uint16_t clampGithubRefresh(uint16_t minutes);
+void clearRiverRuntime();
+void clearGithubRuntime();
+void fillRiverStatusJson(JsonObject root, const RiverFeedRuntime &runtime);
+void fillGithubStatusJson(JsonObject root, const GithubFeedRuntime &runtime);
+void applyRiverObject(JsonObjectConst root);
+void applyGithubObject(JsonObjectConst root);
+bool syncRiver(String *error);
+bool syncGithub(String *error);
+bool syncRiverIfDue(uint32_t now);
+bool syncGithubIfDue(uint32_t now);
+void seedKnownHttpsProfiles();
 
 bool extractUrlHostPort(const String &url, String &host, uint16_t &port) {
     int schemeEnd = url.indexOf("://");
@@ -176,14 +211,6 @@ uint16_t clampWeatherRefresh(uint16_t minutes) {
     return constrain(minutes, kWeatherMinRefreshMinutes, kWeatherMaxRefreshMinutes);
 }
 
-uint16_t clampMarketRefresh(uint16_t minutes) {
-    return constrain(minutes, kMarketMinRefreshMinutes, kMarketMaxRefreshMinutes);
-}
-
-uint16_t clampHomeAssistantRefresh(uint16_t minutes) {
-    return constrain(minutes, kHomeAssistantMinRefreshMinutes, kHomeAssistantMaxRefreshMinutes);
-}
-
 bool weatherCoordinatesValid(float latitude, float longitude) {
     return isfinite(latitude) &&
            isfinite(longitude) &&
@@ -204,28 +231,6 @@ const char* weatherSourceToString(uint8_t source) {
     }
 }
 
-const char* marketSourceToString(uint8_t source) {
-    switch (source) {
-        case MARKET_FEED_FINNHUB:
-            return "finnhub";
-        case MARKET_FEED_COINGECKO:
-            return "coingecko";
-        case MARKET_FEED_DISABLED:
-        default:
-            return "disabled";
-    }
-}
-
-const char* homeAssistantTlsModeToString(uint8_t mode) {
-    switch (mode) {
-        case HOME_ASSISTANT_TLS_FINGERPRINT:
-            return "fingerprint";
-        case HOME_ASSISTANT_TLS_INSECURE:
-        default:
-            return "insecure";
-    }
-}
-
 uint8_t weatherSourceFromVariant(JsonVariantConst value) {
     if (value.isNull()) {
         return feedConfig.weather.source;
@@ -239,45 +244,6 @@ uint8_t weatherSourceFromVariant(JsonVariantConst value) {
             return WEATHER_FEED_OPEN_METEO;
         }
         return WEATHER_FEED_DISABLED;
-    }
-
-    return static_cast<uint8_t>(value.as<int>());
-}
-
-uint8_t marketSourceFromVariant(JsonVariantConst value) {
-    if (value.isNull()) {
-        return MARKET_FEED_DISABLED;
-    }
-
-    if (value.is<const char*>()) {
-        String source = value.as<const char*>();
-        source.toLowerCase();
-
-        if (source == "finnhub") {
-            return MARKET_FEED_FINNHUB;
-        }
-        if (source == "coingecko" || source == "coin-gecko") {
-            return MARKET_FEED_COINGECKO;
-        }
-        return MARKET_FEED_DISABLED;
-    }
-
-    return static_cast<uint8_t>(value.as<int>());
-}
-
-uint8_t homeAssistantTlsModeFromVariant(JsonVariantConst value) {
-    if (value.isNull()) {
-        return HOME_ASSISTANT_TLS_INSECURE;
-    }
-
-    if (value.is<const char*>()) {
-        String mode = value.as<const char*>();
-        mode.toLowerCase();
-
-        if (mode == "fingerprint" || mode == "pinned" || mode == "pin") {
-            return HOME_ASSISTANT_TLS_FINGERPRINT;
-        }
-        return HOME_ASSISTANT_TLS_INSECURE;
     }
 
     return static_cast<uint8_t>(value.as<int>());
@@ -303,26 +269,6 @@ String urlEncode(const String &value) {
     return encoded;
 }
 
-String trimmedLowercaseString(const String &value) {
-    String normalized = value;
-    normalized.trim();
-    normalized.toLowerCase();
-    return normalized;
-}
-
-String normalizeCoinGeckoLookupValue(const String &value) {
-    String normalized = trimmedLowercaseString(value);
-    normalized.replace(" ", "-");
-    normalized.replace("_", "-");
-    return normalized;
-}
-
-String trimStringCopy(const char *value) {
-    String normalized = value != nullptr ? String(value) : String("");
-    normalized.trim();
-    return normalized;
-}
-
 void trimAndCopyString(char *destination, size_t destinationSize, const char *source) {
     String normalized = trimStringCopy(source);
     copyString(destination, destinationSize, normalized.c_str());
@@ -334,66 +280,8 @@ bool isHexDigitChar(char value) {
            (value >= 'a' && value <= 'f');
 }
 
-void normalizeFingerprint(char *value, size_t valueSize) {
-    if (value == nullptr || valueSize == 0) {
-        return;
-    }
-
-    String normalized;
-    normalized.reserve(40);
-    for (size_t index = 0; value[index] != '\0'; ++index) {
-        char character = value[index];
-        if (!isHexDigitChar(character)) {
-            continue;
-        }
-
-        normalized += static_cast<char>(toupper(character));
-        if (normalized.length() == 40) {
-            break;
-        }
-    }
-
-    if (normalized.length() != 40) {
-        value[0] = '\0';
-        return;
-    }
-
-    copyString(value, valueSize, normalized.c_str());
-}
-
 bool baseUrlValid(const String &baseUrl) {
     return baseUrl.startsWith("http://") || baseUrl.startsWith("https://");
-}
-
-void normalizeBaseUrl(char *value, size_t valueSize) {
-    if (value == nullptr || valueSize == 0) {
-        return;
-    }
-
-    String normalized = trimStringCopy(value);
-    while (normalized.endsWith("/")) {
-        normalized.remove(normalized.length() - 1);
-    }
-    copyString(value, valueSize, normalized.c_str());
-}
-
-bool parseFloatStrict(const String &value, float &parsedValue) {
-    if (value.length() == 0) {
-        return false;
-    }
-
-    char buffer[32];
-    copyString(buffer, sizeof(buffer), value.c_str());
-    char *end = nullptr;
-    parsedValue = strtof(buffer, &end);
-    if (end == nullptr || end == buffer) {
-        return false;
-    }
-
-    while (*end == ' ') {
-        ++end;
-    }
-    return *end == '\0' && isfinite(parsedValue);
 }
 
 String humanizeIdentifier(const String &value) {
@@ -419,29 +307,6 @@ String humanizeIdentifier(const String &value) {
 
     label.trim();
     return label;
-}
-
-String humanizeStateText(const String &value) {
-    String normalized = trimStringCopy(value.c_str());
-    if (normalized.length() == 0) {
-        return "No data";
-    }
-
-    normalized.replace("_", " ");
-    bool capitalizeNext = true;
-    for (size_t index = 0; index < normalized.length(); ++index) {
-        char character = normalized.charAt(index);
-        if (capitalizeNext && character >= 'a' && character <= 'z') {
-            normalized.setCharAt(index, static_cast<char>(toupper(character)));
-            capitalizeNext = false;
-        } else if (character == ' ') {
-            capitalizeNext = true;
-        } else {
-            capitalizeNext = false;
-        }
-    }
-
-    return normalized;
 }
 
 String buildWeatherLocationLabel(JsonObjectConst item) {
@@ -477,86 +342,48 @@ void buildWeatherForecastFilter(JsonDocument &filter) {
     daily["precipitation_probability_max"] = true;
 }
 
-void buildCoinGeckoSearchFilter(JsonDocument &filter) {
-    JsonArray coins = filter["coins"].to<JsonArray>();
-    JsonObject coin = coins.add<JsonObject>();
-    coin["id"] = true;
-    coin["name"] = true;
-    coin["symbol"] = true;
-    coin["market_cap_rank"] = true;
-}
-
-void buildCoinGeckoMarketFilter(JsonDocument &filter) {
-    JsonArray markets = filter.to<JsonArray>();
-    JsonObject market = markets.add<JsonObject>();
-    market["symbol"] = true;
-    market["name"] = true;
-    market["current_price"] = true;
-    market["price_change_24h"] = true;
-    market["price_change_percentage_24h"] = true;
-}
-
-void buildFinnhubQuoteFilter(JsonDocument &filter) {
-    filter["c"] = true;
-    filter["d"] = true;
-    filter["dp"] = true;
-}
-
-void buildHomeAssistantStateFilter(JsonDocument &filter) {
-    filter["entity_id"] = true;
-    filter["state"] = true;
-
-    JsonObject attributes = filter["attributes"].to<JsonObject>();
-    attributes["friendly_name"] = true;
-    attributes["unit_of_measurement"] = true;
-}
-
 void setConfigDefaults() {
     memset(&feedConfig, 0, sizeof(feedConfig));
     feedConfig.version = FEEDS_CONFIG_VERSION;
 
-    feedConfig.weather.source = WEATHER_FEED_DISABLED;
+    // Weather is on by default, pointed at Seoul, so a fresh device shows a
+    // live forecast without any setup (matching the river and github feeds).
+    feedConfig.weather.source = WEATHER_FEED_OPEN_METEO;
     feedConfig.weather.refreshMinutes = 30;
     feedConfig.weather.useFahrenheit = false;
+    copyString(feedConfig.weather.query, sizeof(feedConfig.weather.query), "Seoul");
+    copyString(feedConfig.weather.label, sizeof(feedConfig.weather.label), "Seoul");
+    feedConfig.weather.latitude = 37.5665f;
+    feedConfig.weather.longitude = 126.9780f;
 
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        feedConfig.markets[index].source = MARKET_FEED_DISABLED;
-        feedConfig.markets[index].refreshMinutes = 10;
-        copyString(feedConfig.markets[index].currency, sizeof(feedConfig.markets[index].currency), "usd");
-    }
+    feedConfig.river.enabled = true;
+    copyString(feedConfig.river.apiKey, sizeof(feedConfig.river.apiKey), "sample");
+    copyString(feedConfig.river.station, sizeof(feedConfig.river.station), kRiverDefaultStation);
+    feedConfig.river.refreshMinutes = 20;
 
-    feedConfig.homeAssistant.enabled = false;
-    feedConfig.homeAssistant.tlsMode = HOME_ASSISTANT_TLS_INSECURE;
-    feedConfig.homeAssistant.refreshMinutes = 2;
+    feedConfig.github.enabled = true;
+    feedConfig.github.useGlobalFeed = false;
+    feedConfig.github.refreshMinutes = 3;
+    // Organisations rather than single repositories: their feeds mix every
+    // repository they own, so the page does not sit on one repo's star stream.
+    copyString(feedConfig.github.repos[0], sizeof(feedConfig.github.repos[0]), "robotis-git");
+    copyString(feedConfig.github.repos[1], sizeof(feedConfig.github.repos[1]), "ros2");
+    copyString(feedConfig.github.repos[2], sizeof(feedConfig.github.repos[2]), "huggingface");
+    copyString(feedConfig.github.repos[3], sizeof(feedConfig.github.repos[3]), "nvidia");
 }
 
 void clearWeatherRuntime() {
     memset(&feedRuntime.weather, 0, sizeof(feedRuntime.weather));
 }
 
-void clearMarketRuntime(uint8_t index) {
-    if (index >= DASHBOARD_MARKET_COUNT) {
-        return;
-    }
-
-    memset(&feedRuntime.markets[index], 0, sizeof(feedRuntime.markets[index]));
-}
-
-void clearHomeAssistantRuntime() {
-    memset(&feedRuntime.homeAssistant, 0, sizeof(feedRuntime.homeAssistant));
-}
-
 void clearAllRuntime() {
     clearWeatherRuntime();
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        clearMarketRuntime(index);
-    }
-    clearHomeAssistantRuntime();
+    clearRiverRuntime();
+    clearGithubRuntime();
 }
 
 void normalizeConfig() {
     feedConfig.version = FEEDS_CONFIG_VERSION;
-    feedConfig.finnhubApiKey[sizeof(feedConfig.finnhubApiKey) - 1] = '\0';
 
     feedConfig.weather.source = constrain(feedConfig.weather.source, WEATHER_FEED_DISABLED, WEATHER_FEED_OPEN_METEO);
     if (feedConfig.weather.source == WEATHER_FEED_MANUAL) {
@@ -572,35 +399,23 @@ void normalizeConfig() {
         feedConfig.weather.longitude = 0.0f;
     }
 
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        MarketFeedConfig &market = feedConfig.markets[index];
-        market.source = constrain(market.source, MARKET_FEED_DISABLED, MARKET_FEED_COINGECKO);
-        if (market.source == MARKET_FEED_MANUAL) {
-            market.source = MARKET_FEED_DISABLED;
-        }
-        market.symbol[sizeof(market.symbol) - 1] = '\0';
-        market.label[sizeof(market.label) - 1] = '\0';
-        market.currency[sizeof(market.currency) - 1] = '\0';
-        if (market.currency[0] == '\0') {
-            copyString(market.currency, sizeof(market.currency), "usd");
-        }
-        lowercaseCString(market.currency);
-        market.refreshMinutes = clampMarketRefresh(market.refreshMinutes);
+    RiverFeedConfig &river = feedConfig.river;
+    trimAndCopyString(river.apiKey, sizeof(river.apiKey), river.apiKey);
+    trimAndCopyString(river.station, sizeof(river.station), river.station);
+    if (river.apiKey[0] == '\0') {
+        copyString(river.apiKey, sizeof(river.apiKey), "sample");
     }
-
-    HomeAssistantConfig &homeAssistant = feedConfig.homeAssistant;
-    normalizeBaseUrl(homeAssistant.baseUrl, sizeof(homeAssistant.baseUrl));
-    trimAndCopyString(homeAssistant.token, sizeof(homeAssistant.token), homeAssistant.token);
-    homeAssistant.tlsMode = constrain(homeAssistant.tlsMode, HOME_ASSISTANT_TLS_INSECURE, HOME_ASSISTANT_TLS_FINGERPRINT);
-    normalizeFingerprint(homeAssistant.fingerprint, sizeof(homeAssistant.fingerprint));
-    homeAssistant.refreshMinutes = clampHomeAssistantRefresh(homeAssistant.refreshMinutes);
-
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        HomeAssistantSlotConfig &slot = homeAssistant.slots[index];
-        trimAndCopyString(slot.entityId, sizeof(slot.entityId), slot.entityId);
-        trimAndCopyString(slot.label, sizeof(slot.label), slot.label);
-        trimAndCopyString(slot.unit, sizeof(slot.unit), slot.unit);
+    if (river.station[0] == '\0') {
+        copyString(river.station, sizeof(river.station), kRiverDefaultStation);
     }
+    river.refreshMinutes = clampRiverRefresh(river.refreshMinutes);
+
+    GithubFeedConfig &github = feedConfig.github;
+    trimAndCopyString(github.token, sizeof(github.token), github.token);
+    for (uint8_t index = 0; index < GITHUB_REPO_SLOT_COUNT; ++index) {
+        trimAndCopyString(github.repos[index], sizeof(github.repos[index]), github.repos[index]);
+    }
+    github.refreshMinutes = clampGithubRefresh(github.refreshMinutes);
 }
 
 void clearRuntimeForInactiveSources() {
@@ -608,20 +423,12 @@ void clearRuntimeForInactiveSources() {
         clearWeatherRuntime();
     }
 
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        if (feedConfig.markets[index].source != MARKET_FEED_FINNHUB &&
-            feedConfig.markets[index].source != MARKET_FEED_COINGECKO) {
-            clearMarketRuntime(index);
-            continue;
-        }
-
-        if (!feedsMarketConfigured(index)) {
-            clearMarketRuntime(index);
-        }
+    if (!feedsRiverConfigured()) {
+        clearRiverRuntime();
     }
 
-    if (!feedsHomeAssistantConfigured()) {
-        clearHomeAssistantRuntime();
+    if (!feedsGithubConfigured()) {
+        clearGithubRuntime();
     }
 }
 
@@ -634,36 +441,6 @@ bool weatherIdentityChanged(const FeedConfig &before, const FeedConfig &after) {
            before.weather.useFahrenheit != after.weather.useFahrenheit;
 }
 
-bool marketIdentityChanged(const MarketFeedConfig &before, const MarketFeedConfig &after) {
-    return before.source != after.source ||
-           strcmp(before.symbol, after.symbol) != 0 ||
-           strcmp(before.label, after.label) != 0 ||
-           strcmp(before.currency, after.currency) != 0;
-}
-
-bool homeAssistantSlotIdentityChanged(const HomeAssistantSlotConfig &before, const HomeAssistantSlotConfig &after) {
-    return before.enabled != after.enabled ||
-           strcmp(before.entityId, after.entityId) != 0;
-}
-
-bool homeAssistantIdentityChanged(const HomeAssistantConfig &before, const HomeAssistantConfig &after) {
-    if (before.enabled != after.enabled ||
-        strcmp(before.baseUrl, after.baseUrl) != 0 ||
-        strcmp(before.token, after.token) != 0 ||
-        before.tlsMode != after.tlsMode ||
-        strcmp(before.fingerprint, after.fingerprint) != 0) {
-        return true;
-    }
-
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        if (homeAssistantSlotIdentityChanged(before.slots[index], after.slots[index])) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 bool weatherConfigEquals(const WeatherFeedConfig &left, const WeatherFeedConfig &right) {
     return left.source == right.source &&
            strcmp(left.query, right.query) == 0 &&
@@ -674,50 +451,27 @@ bool weatherConfigEquals(const WeatherFeedConfig &left, const WeatherFeedConfig 
            left.useFahrenheit == right.useFahrenheit;
 }
 
-bool marketConfigEquals(const MarketFeedConfig &left, const MarketFeedConfig &right) {
-    return left.source == right.source &&
-           strcmp(left.symbol, right.symbol) == 0 &&
-           strcmp(left.label, right.label) == 0 &&
-           strcmp(left.currency, right.currency) == 0 &&
-           left.refreshMinutes == right.refreshMinutes;
-}
-
-bool homeAssistantSlotConfigEquals(const HomeAssistantSlotConfig &left, const HomeAssistantSlotConfig &right) {
-    return left.enabled == right.enabled &&
-           strcmp(left.entityId, right.entityId) == 0 &&
-           strcmp(left.label, right.label) == 0 &&
-           strcmp(left.unit, right.unit) == 0;
-}
-
-bool homeAssistantConfigEquals(const HomeAssistantConfig &left, const HomeAssistantConfig &right) {
-    if (left.enabled != right.enabled ||
-        strcmp(left.baseUrl, right.baseUrl) != 0 ||
-        strcmp(left.token, right.token) != 0 ||
-        left.tlsMode != right.tlsMode ||
-        strcmp(left.fingerprint, right.fingerprint) != 0 ||
-        left.refreshMinutes != right.refreshMinutes) {
-        return false;
-    }
-
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        if (!homeAssistantSlotConfigEquals(left.slots[index], right.slots[index])) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 bool feedConfigEquals(const FeedConfig &left, const FeedConfig &right) {
-    if (left.version != right.version ||
-        strcmp(left.finnhubApiKey, right.finnhubApiKey) != 0 ||
-        !weatherConfigEquals(left.weather, right.weather) ||
-        !homeAssistantConfigEquals(left.homeAssistant, right.homeAssistant)) {
+    if (left.version != right.version || !weatherConfigEquals(left.weather, right.weather)) {
         return false;
     }
 
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        if (!marketConfigEquals(left.markets[index], right.markets[index])) {
+    if (left.river.enabled != right.river.enabled ||
+        strcmp(left.river.apiKey, right.river.apiKey) != 0 ||
+        strcmp(left.river.station, right.river.station) != 0 ||
+        left.river.refreshMinutes != right.river.refreshMinutes) {
+        return false;
+    }
+
+    if (left.github.enabled != right.github.enabled ||
+        left.github.useGlobalFeed != right.github.useGlobalFeed ||
+        strcmp(left.github.token, right.github.token) != 0 ||
+        left.github.refreshMinutes != right.github.refreshMinutes) {
+        return false;
+    }
+
+    for (uint8_t index = 0; index < GITHUB_REPO_SLOT_COUNT; ++index) {
+        if (strcmp(left.github.repos[index], right.github.repos[index]) != 0) {
             return false;
         }
     }
@@ -743,25 +497,6 @@ void fillWeatherDataJson(JsonObject root, const WeatherData &weather) {
     root["rainChance"] = weather.rainChance;
 }
 
-void fillMarketDataJson(JsonObject root, const MarketData &market) {
-    root["enabled"] = market.enabled;
-    root["symbol"] = market.symbol;
-    root["label"] = market.label;
-    root["price"] = market.price;
-    root["change"] = market.change;
-    root["changePercent"] = market.changePercent;
-}
-
-void fillHomeAssistantSlotDataJson(JsonObject root, const HomeAssistantSlotData &slot) {
-    root["enabled"] = slot.enabled;
-    root["hasData"] = slot.hasData;
-    root["numeric"] = slot.numeric;
-    root["entityId"] = slot.entityId;
-    root["label"] = slot.label;
-    root["state"] = slot.state;
-    root["unit"] = slot.unit;
-}
-
 void fillWeatherStatusJson(JsonObject root, const WeatherFeedRuntime &runtime) {
     root["syncing"] = runtime.syncing;
     root["hasData"] = runtime.hasData;
@@ -775,38 +510,8 @@ void fillWeatherStatusJson(JsonObject root, const WeatherFeedRuntime &runtime) {
     }
 }
 
-void fillMarketStatusJson(JsonObject root, const MarketFeedRuntime &runtime) {
-    root["syncing"] = runtime.syncing;
-    root["hasData"] = runtime.hasData;
-    root["lastError"] = runtime.lastError;
-    root["lastAttemptAgeSec"] = runtime.lastAttemptMs > 0 ? static_cast<long>((millis() - runtime.lastAttemptMs) / 1000UL) : -1;
-    root["lastSuccessAgeSec"] = runtime.lastSuccessMs > 0 ? static_cast<long>((millis() - runtime.lastSuccessMs) / 1000UL) : -1;
-
-    JsonObject data = root["data"].to<JsonObject>();
-    if (runtime.hasData) {
-        fillMarketDataJson(data, runtime.data);
-    }
-}
-
-void fillHomeAssistantStatusJson(JsonObject root, const HomeAssistantRuntime &runtime) {
-    root["syncing"] = runtime.syncing;
-    root["hasData"] = runtime.hasData;
-    root["lastError"] = runtime.lastError;
-    root["lastAttemptAgeSec"] = runtime.lastAttemptMs > 0 ? static_cast<long>((millis() - runtime.lastAttemptMs) / 1000UL) : -1;
-    root["lastSuccessAgeSec"] = runtime.lastSuccessMs > 0 ? static_cast<long>((millis() - runtime.lastSuccessMs) / 1000UL) : -1;
-
-    JsonArray slots = root["slots"].to<JsonArray>();
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        JsonObject slot = slots.add<JsonObject>();
-        fillHomeAssistantSlotDataJson(slot, runtime.slots[index]);
-    }
-}
-
 void fillConfigJson(JsonObject root) {
     root["version"] = feedConfig.version;
-
-    JsonObject providers = root["providers"].to<JsonObject>();
-    providers["finnhubApiKey"] = feedConfig.finnhubApiKey;
 
     JsonObject weather = root["weather"].to<JsonObject>();
     weather["source"] = weatherSourceToString(feedConfig.weather.source);
@@ -817,31 +522,21 @@ void fillConfigJson(JsonObject root) {
     weather["refreshMinutes"] = feedConfig.weather.refreshMinutes;
     weather["useFahrenheit"] = feedConfig.weather.useFahrenheit;
 
-    JsonArray markets = root["markets"].to<JsonArray>();
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        JsonObject market = markets.add<JsonObject>();
-        market["source"] = marketSourceToString(feedConfig.markets[index].source);
-        market["symbol"] = feedConfig.markets[index].symbol;
-        market["label"] = feedConfig.markets[index].label;
-        market["currency"] = feedConfig.markets[index].currency;
-        market["refreshMinutes"] = feedConfig.markets[index].refreshMinutes;
-    }
+    JsonObject river = root["river"].to<JsonObject>();
+    river["enabled"] = feedConfig.river.enabled;
+    river["apiKey"] = feedConfig.river.apiKey;
+    river["station"] = feedConfig.river.station;
+    river["refreshMinutes"] = feedConfig.river.refreshMinutes;
 
-    JsonObject homeAssistant = root["homeAssistant"].to<JsonObject>();
-    homeAssistant["enabled"] = feedConfig.homeAssistant.enabled;
-    homeAssistant["baseUrl"] = feedConfig.homeAssistant.baseUrl;
-    homeAssistant["token"] = feedConfig.homeAssistant.token;
-    homeAssistant["tlsMode"] = homeAssistantTlsModeToString(feedConfig.homeAssistant.tlsMode);
-    homeAssistant["fingerprint"] = feedConfig.homeAssistant.fingerprint;
-    homeAssistant["refreshMinutes"] = feedConfig.homeAssistant.refreshMinutes;
+    JsonObject github = root["github"].to<JsonObject>();
+    github["enabled"] = feedConfig.github.enabled;
+    github["useGlobalFeed"] = feedConfig.github.useGlobalFeed;
+    github["token"] = feedConfig.github.token;
+    github["refreshMinutes"] = feedConfig.github.refreshMinutes;
 
-    JsonArray homeSlots = homeAssistant["slots"].to<JsonArray>();
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        JsonObject slot = homeSlots.add<JsonObject>();
-        slot["enabled"] = feedConfig.homeAssistant.slots[index].enabled;
-        slot["entityId"] = feedConfig.homeAssistant.slots[index].entityId;
-        slot["label"] = feedConfig.homeAssistant.slots[index].label;
-        slot["unit"] = feedConfig.homeAssistant.slots[index].unit;
+    JsonArray githubRepos = github["repos"].to<JsonArray>();
+    for (uint8_t index = 0; index < GITHUB_REPO_SLOT_COUNT; ++index) {
+        githubRepos.add(feedConfig.github.repos[index]);
     }
 }
 
@@ -849,14 +544,11 @@ void fillStatusJson(JsonObject root) {
     JsonObject weather = root["weather"].to<JsonObject>();
     fillWeatherStatusJson(weather, feedRuntime.weather);
 
-    JsonArray markets = root["markets"].to<JsonArray>();
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        JsonObject market = markets.add<JsonObject>();
-        fillMarketStatusJson(market, feedRuntime.markets[index]);
-    }
+    JsonObject river = root["river"].to<JsonObject>();
+    fillRiverStatusJson(river, feedRuntime.river);
 
-    JsonObject homeAssistant = root["homeAssistant"].to<JsonObject>();
-    fillHomeAssistantStatusJson(homeAssistant, feedRuntime.homeAssistant);
+    JsonObject github = root["github"].to<JsonObject>();
+    fillGithubStatusJson(github, feedRuntime.github);
 }
 
 bool writeJsonToFile(const char *path, JsonDocument &doc) {
@@ -1066,26 +758,11 @@ bool httpGetJson(const String &url,
     } displayHeapGuard;
 
     uint32_t freeHeap = ESP.getFreeHeap();
-    if (freeHeap < kHttpsMinFreeHeapBytes) {
-        if (error != nullptr) {
-            *error = "Low heap, retrying later";
-        }
-        logPrintf("Skipping HTTPS request, free heap too low: %u (%s)", freeHeap, url.c_str());
-        return false;
-    }
 
-    if (freeHeap < kHttpsPreferredFreeHeapBytes) {
-        logPrintf("HTTPS request in low-heap window: %u (%s)", freeHeap, url.c_str());
-    }
-
-    std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
-    if (!client) {
-        if (error != nullptr) {
-            *error = "TLS client allocation failed";
-        }
-        return false;
-    }
-
+    // Work out the receive buffer before checking the heap. A host that
+    // negotiates a small TLS fragment needs a fraction of the 16 kB default, so
+    // a flat requirement would reject every request on a device that in
+    // practice never has that much free.
     String host;
     uint16_t port = 443;
     uint16_t recvBufferSize = kHttpsDefaultRecvBufferBytes;
@@ -1100,31 +777,32 @@ bool httpGetJson(const String &url,
             if (fragmentLength > 0) {
                 recvBufferSize = fragmentLength;
             }
-        } else {
-            logPrintf("Skipping HTTPS MFLN probe, low heap window: %u (%s)",
-                      freeHeap,
-                      host.c_str());
         }
     }
 
-    if (options != nullptr &&
-        options->tlsMode == HOME_ASSISTANT_TLS_FINGERPRINT) {
-        if (options->fingerprint == nullptr || options->fingerprint[0] == '\0') {
-            if (error != nullptr) {
-                *error = "Fingerprint missing";
-            }
-            return false;
+    uint32_t requiredHeap = static_cast<uint32_t>(recvBufferSize) + kHttpsWorkingHeapBytes;
+    if (freeHeap < requiredHeap) {
+        if (error != nullptr) {
+            *error = "Low heap, retrying later";
         }
-
-        if (!client->setFingerprint(options->fingerprint)) {
-            if (error != nullptr) {
-                *error = "Fingerprint invalid";
-            }
-            return false;
-        }
-    } else {
-        client->setInsecure();
+        logPrintf("Skipping HTTPS request, free heap %u below required %u (%s)",
+                  freeHeap,
+                  requiredHeap,
+                  url.c_str());
+        return false;
     }
+
+    std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
+    if (!client) {
+        if (error != nullptr) {
+            *error = "TLS client allocation failed";
+        }
+        return false;
+    }
+
+    // Only api.github.com is reached over TLS now, and it is a public endpoint,
+    // so the certificate is not pinned.
+    client->setInsecure();
     client->setBufferSizes(recvBufferSize, kHttpsCompactXmitBufferBytes);
     logPrintf("HTTPS buffers: recv=%u xmit=%u (%s)",
               recvBufferSize,
@@ -1194,113 +872,6 @@ bool resolveWeatherLocationFromQuery(String *error) {
     }
 
     updateDraftState();
-    return true;
-}
-
-bool fetchCoinGeckoMarketJson(const String &marketId, const String &currency, JsonDocument &doc, String *error) {
-    String url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=" + urlEncode(currency) +
-                 "&ids=" + urlEncode(marketId) +
-                 "&sparkline=false&price_change_percentage=24h";
-    JsonDocument filter;
-    buildCoinGeckoMarketFilter(filter);
-    return httpGetJson(url, doc, error, &filter);
-}
-
-int coinGeckoCandidateScore(const String &input, JsonObjectConst coin) {
-    String candidateId = coin["id"].isNull() ? String("") : normalizeCoinGeckoLookupValue(coin["id"].as<const char*>());
-    String candidateName = coin["name"].isNull() ? String("") : trimmedLowercaseString(coin["name"].as<const char*>());
-    String candidateSymbol = coin["symbol"].isNull() ? String("") : trimmedLowercaseString(coin["symbol"].as<const char*>());
-
-    if (candidateId == input) {
-        return 600;
-    }
-    if (candidateSymbol == input) {
-        return 560;
-    }
-    if (candidateName == input) {
-        return 520;
-    }
-    if (candidateId.startsWith(input)) {
-        return 420;
-    }
-    if (candidateName.startsWith(input)) {
-        return 360;
-    }
-    if (candidateSymbol.startsWith(input)) {
-        return 320;
-    }
-    if (candidateId.indexOf(input) >= 0) {
-        return 240;
-    }
-    if (candidateName.indexOf(input) >= 0) {
-        return 180;
-    }
-    if (candidateSymbol.indexOf(input) >= 0) {
-        return 140;
-    }
-    return 0;
-}
-
-bool resolveCoinGeckoAsset(const String &query,
-                           String &resolvedId,
-                           String &resolvedName,
-                           String *error) {
-    String normalizedQuery = normalizeCoinGeckoLookupValue(query);
-    if (normalizedQuery.length() == 0) {
-        if (error != nullptr) {
-            *error = "CoinGecko symbol missing";
-        }
-        return false;
-    }
-
-    JsonDocument doc;
-    String requestError;
-    String url = "https://api.coingecko.com/api/v3/search?query=" + urlEncode(normalizedQuery);
-    JsonDocument filter;
-    buildCoinGeckoSearchFilter(filter);
-    if (!httpGetJson(url, doc, &requestError, &filter)) {
-        if (error != nullptr) {
-            *error = requestError;
-        }
-        return false;
-    }
-
-    JsonArrayConst coins = doc["coins"].as<JsonArrayConst>();
-    if (coins.isNull() || coins.size() == 0) {
-        if (error != nullptr) {
-            *error = "CoinGecko returned no match";
-        }
-        return false;
-    }
-
-    JsonObjectConst bestCoin;
-    int bestScore = -1;
-    int bestRank = INT_MAX;
-
-    for (JsonObjectConst coin : coins) {
-        int score = coinGeckoCandidateScore(normalizedQuery, coin);
-        int rank = coin["market_cap_rank"].isNull() ? INT_MAX : coin["market_cap_rank"].as<int>();
-        if (score > bestScore || (score == bestScore && rank < bestRank)) {
-            bestCoin = coin;
-            bestScore = score;
-            bestRank = rank;
-        }
-    }
-
-    if (bestCoin.isNull()) {
-        bestCoin = coins[0].as<JsonObjectConst>();
-    }
-
-    resolvedId = bestCoin["id"].isNull() ? String("") : normalizeCoinGeckoLookupValue(bestCoin["id"].as<const char*>());
-    resolvedName = bestCoin["name"].isNull() ? String("") : String(bestCoin["name"].as<const char*>());
-
-    if (resolvedId.length() == 0) {
-        if (error != nullptr) {
-            *error = "CoinGecko returned no match";
-        }
-        return false;
-    }
-
     return true;
 }
 
@@ -1398,449 +969,6 @@ bool syncWeather(String *error) {
     return true;
 }
 
-String uppercaseString(const String &value) {
-    String upper = value;
-    upper.toUpperCase();
-    return upper;
-}
-
-String trimTrailingZerosString(const String &value) {
-    String result = value;
-    while (result.endsWith("0")) {
-        result.remove(result.length() - 1);
-    }
-    if (result.endsWith(".")) {
-        result.remove(result.length() - 1);
-    }
-    return result;
-}
-
-String groupThousandsString(const String &value) {
-    int decimalIndex = value.indexOf('.');
-    if (decimalIndex < 0) {
-        decimalIndex = value.length();
-    }
-
-    int startIndex = value.startsWith("-") ? 1 : 0;
-    if (decimalIndex - startIndex <= 3) {
-        return value;
-    }
-
-    String grouped;
-    grouped.reserve(value.length() + ((decimalIndex - startIndex - 1) / 3));
-    if (startIndex == 1) {
-        grouped += '-';
-    }
-
-    for (int index = startIndex; index < static_cast<int>(value.length()); ++index) {
-        grouped += value.charAt(index);
-
-        if (index < decimalIndex - 1) {
-            int remainingDigits = decimalIndex - index - 1;
-            if (remainingDigits > 0 && (remainingDigits % 3) == 0) {
-                grouped += ',';
-            }
-        }
-    }
-
-    return grouped;
-}
-
-String formatHomeAssistantNumericState(float value) {
-    float absoluteValue = value >= 0.0f ? value : -value;
-    uint8_t precision = 2;
-
-    if (absoluteValue >= 1000.0f) {
-        precision = 0;
-    } else if (absoluteValue >= 100.0f) {
-        precision = 1;
-    } else if (absoluteValue >= 10.0f) {
-        precision = 1;
-    } else if (absoluteValue >= 1.0f) {
-        precision = 2;
-    } else if (absoluteValue >= 0.1f) {
-        precision = 3;
-    } else {
-        precision = 4;
-    }
-
-    return groupThousandsString(trimTrailingZerosString(String(value, precision)));
-}
-
-bool homeAssistantSlotConfigured(const HomeAssistantSlotConfig &slot) {
-    return slot.enabled && slot.entityId[0] != '\0';
-}
-
-String buildHomeAssistantSlotLabel(const HomeAssistantSlotConfig &slot, JsonObjectConst attributes) {
-    if (slot.label[0] != '\0') {
-        return String(slot.label);
-    }
-
-    if (!attributes.isNull() && !attributes["friendly_name"].isNull()) {
-        String friendlyName = trimStringCopy(attributes["friendly_name"].as<const char*>());
-        if (friendlyName.length() > 0) {
-            return friendlyName;
-        }
-    }
-
-    return humanizeIdentifier(String(slot.entityId));
-}
-
-String buildHomeAssistantSlotUnit(const HomeAssistantSlotConfig &slot, JsonObjectConst attributes) {
-    if (slot.unit[0] != '\0') {
-        return String(slot.unit);
-    }
-
-    if (!attributes.isNull() && !attributes["unit_of_measurement"].isNull()) {
-        return trimStringCopy(attributes["unit_of_measurement"].as<const char*>());
-    }
-
-    return "";
-}
-
-String normalizeHomeAssistantStateForDisplay(const String &rawState, bool &numeric) {
-    numeric = false;
-
-    String trimmedState = trimStringCopy(rawState.c_str());
-    if (trimmedState.length() == 0) {
-        return "No data";
-    }
-
-    String lowered = trimmedLowercaseString(trimmedState);
-    if (lowered == "unknown" || lowered == "unavailable" || lowered == "none") {
-        return humanizeStateText(trimmedState);
-    }
-
-    float numericValue = 0.0f;
-    if (parseFloatStrict(trimmedState, numericValue)) {
-        numeric = true;
-        return formatHomeAssistantNumericState(numericValue);
-    }
-
-    return humanizeStateText(trimmedState);
-}
-
-bool syncHomeAssistantSlot(uint8_t index, String *error) {
-    if (index >= HOME_ASSISTANT_SLOT_COUNT) {
-        if (error != nullptr) {
-            *error = "Home slot out of range";
-        }
-        return false;
-    }
-
-    const HomeAssistantSlotConfig &slot = feedConfig.homeAssistant.slots[index];
-    if (!homeAssistantSlotConfigured(slot)) {
-        if (error != nullptr) {
-            *error = "Home slot not configured";
-        }
-        return false;
-    }
-
-    String url = String(feedConfig.homeAssistant.baseUrl) + "/api/states/" + urlEncode(slot.entityId);
-    JsonDocument doc;
-    JsonDocument filter;
-    buildHomeAssistantStateFilter(filter);
-    HttpJsonRequestOptions requestOptions = {
-        feedConfig.homeAssistant.token,
-        feedConfig.homeAssistant.tlsMode,
-        feedConfig.homeAssistant.fingerprint
-    };
-
-    String requestError;
-    if (!httpGetJson(url, doc, &requestError, &filter, &requestOptions)) {
-        if (error != nullptr) {
-            *error = requestError;
-        }
-        return false;
-    }
-
-    JsonObjectConst attributes = doc["attributes"].as<JsonObjectConst>();
-    String entityId = trimStringCopy(doc["entity_id"] | slot.entityId);
-    String rawState = trimStringCopy(doc["state"] | "");
-    if (entityId.length() == 0 || rawState.length() == 0) {
-        if (error != nullptr) {
-            *error = "Home Assistant payload incomplete";
-        }
-        return false;
-    }
-
-    HomeAssistantSlotData &runtimeSlot = feedRuntime.homeAssistant.slots[index];
-    bool numeric = false;
-    String displayState = normalizeHomeAssistantStateForDisplay(rawState, numeric);
-    String label = buildHomeAssistantSlotLabel(slot, attributes);
-    String unit = buildHomeAssistantSlotUnit(slot, attributes);
-
-    memset(&runtimeSlot, 0, sizeof(runtimeSlot));
-    runtimeSlot.enabled = true;
-    runtimeSlot.hasData = true;
-    runtimeSlot.numeric = numeric;
-    copyString(runtimeSlot.entityId, sizeof(runtimeSlot.entityId), entityId.c_str());
-    copyString(runtimeSlot.label, sizeof(runtimeSlot.label), label.c_str());
-    copyString(runtimeSlot.state, sizeof(runtimeSlot.state), displayState.c_str());
-    copyString(runtimeSlot.unit, sizeof(runtimeSlot.unit), unit.c_str());
-    return true;
-}
-
-bool syncHomeAssistant(String *error) {
-    if (WiFi.status() != WL_CONNECTED) {
-        if (error != nullptr) {
-            *error = "WiFi disconnected";
-        }
-        return false;
-    }
-
-    if (!feedsHomeAssistantConfigured()) {
-        if (error != nullptr) {
-            *error = "Home Assistant not configured";
-        }
-        return false;
-    }
-
-    HomeAssistantRuntime &runtime = feedRuntime.homeAssistant;
-    runtime.syncing = true;
-    runtime.lastAttemptMs = millis();
-    runtime.lastError[0] = '\0';
-
-    bool anyConfigured = false;
-    bool anySuccess = false;
-    String firstError;
-
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        const HomeAssistantSlotConfig &slot = feedConfig.homeAssistant.slots[index];
-        if (!homeAssistantSlotConfigured(slot)) {
-            memset(&runtime.slots[index], 0, sizeof(runtime.slots[index]));
-            continue;
-        }
-
-        anyConfigured = true;
-        String slotError;
-        bool success = syncHomeAssistantSlot(index, &slotError);
-        anySuccess = anySuccess || success;
-        if (!success && firstError.length() == 0) {
-            firstError = slotError;
-        }
-        yield();
-    }
-
-    runtime.syncing = false;
-    runtime.hasData = false;
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        runtime.hasData = runtime.hasData || runtime.slots[index].hasData;
-    }
-
-    if (!anyConfigured) {
-        if (error != nullptr) {
-            *error = "No Home Assistant slots configured";
-        }
-        copyString(runtime.lastError, sizeof(runtime.lastError), "No slots configured");
-        return false;
-    }
-
-    if (!anySuccess) {
-        copyString(runtime.lastError,
-                   sizeof(runtime.lastError),
-                   firstError.length() > 0 ? firstError.c_str() : "Home Assistant sync failed");
-        if (error != nullptr) {
-            *error = runtime.lastError;
-        }
-        return false;
-    }
-
-    runtime.lastSuccessMs = millis();
-    runtime.lastError[0] = '\0';
-    logPrint(F("Home Assistant sync OK"));
-    return true;
-}
-
-bool syncFinnhubMarket(uint8_t index, String *error) {
-    if (feedConfig.finnhubApiKey[0] == '\0') {
-        if (error != nullptr) {
-            *error = "Finnhub API key missing";
-        }
-        return false;
-    }
-
-    String url = "https://finnhub.io/api/v1/quote?symbol=" + urlEncode(feedConfig.markets[index].symbol) +
-                 "&token=" + urlEncode(feedConfig.finnhubApiKey);
-
-    JsonDocument doc;
-    String requestError;
-    JsonDocument filter;
-    buildFinnhubQuoteFilter(filter);
-    if (!httpGetJson(url, doc, &requestError, &filter)) {
-        if (error != nullptr) {
-            *error = requestError;
-        }
-        return false;
-    }
-
-    if (doc["c"].isNull()) {
-        if (error != nullptr) {
-            *error = "Finnhub payload incomplete";
-        }
-        return false;
-    }
-
-    MarketFeedRuntime &runtime = feedRuntime.markets[index];
-    memset(&runtime.data, 0, sizeof(runtime.data));
-    runtime.data.enabled = true;
-    copyString(runtime.data.symbol, sizeof(runtime.data.symbol), uppercaseString(feedConfig.markets[index].symbol).c_str());
-    copyString(runtime.data.label, sizeof(runtime.data.label), feedConfig.markets[index].label);
-    runtime.data.price = doc["c"].as<float>();
-    runtime.data.change = doc["d"] | 0.0f;
-    runtime.data.changePercent = doc["dp"] | 0.0f;
-    return true;
-}
-
-bool syncCoinGeckoMarket(uint8_t index, String *error) {
-    String currency = feedConfig.markets[index].currency;
-    if (currency.length() == 0) {
-        currency = "usd";
-    }
-
-    JsonDocument doc;
-    String requestError;
-    String marketId = normalizeCoinGeckoLookupValue(feedConfig.markets[index].symbol);
-    if (marketId.length() == 0) {
-        if (error != nullptr) {
-            *error = "CoinGecko symbol missing";
-        }
-        return false;
-    }
-
-    if (!fetchCoinGeckoMarketJson(marketId, currency, doc, &requestError)) {
-        if (error != nullptr) {
-            *error = requestError;
-        }
-        return false;
-    }
-
-    JsonArrayConst markets = doc.as<JsonArrayConst>();
-    if (markets.isNull() || markets.size() == 0) {
-        String resolvedId;
-        String resolvedName;
-        if (!resolveCoinGeckoAsset(feedConfig.markets[index].symbol, resolvedId, resolvedName, &requestError)) {
-            if (error != nullptr) {
-                *error = requestError;
-            }
-            return false;
-        }
-
-        doc.clear();
-        if (!fetchCoinGeckoMarketJson(resolvedId, currency, doc, &requestError)) {
-            if (error != nullptr) {
-                *error = requestError;
-            }
-            return false;
-        }
-
-        markets = doc.as<JsonArrayConst>();
-        if (markets.isNull() || markets.size() == 0) {
-            if (error != nullptr) {
-                *error = "CoinGecko returned no match";
-            }
-            return false;
-        }
-
-        copyString(feedConfig.markets[index].symbol, sizeof(feedConfig.markets[index].symbol), resolvedId.c_str());
-        if (feedConfig.markets[index].label[0] == '\0' && resolvedName.length() > 0) {
-            copyString(feedConfig.markets[index].label, sizeof(feedConfig.markets[index].label), resolvedName.c_str());
-        }
-        updateDraftState();
-    }
-
-    JsonObjectConst source = markets[0].as<JsonObjectConst>();
-    if (source.isNull() || source["current_price"].isNull()) {
-        if (error != nullptr) {
-            *error = "CoinGecko payload incomplete";
-        }
-        return false;
-    }
-
-    String providerSymbol = source["symbol"].isNull() ? String(feedConfig.markets[index].symbol) : String(source["symbol"].as<const char*>());
-    String providerName = source["name"].isNull() ? String("") : String(source["name"].as<const char*>());
-
-    MarketFeedRuntime &runtime = feedRuntime.markets[index];
-    memset(&runtime.data, 0, sizeof(runtime.data));
-    runtime.data.enabled = true;
-    copyString(runtime.data.symbol,
-               sizeof(runtime.data.symbol),
-               uppercaseString(providerSymbol).c_str());
-    copyString(runtime.data.label,
-               sizeof(runtime.data.label),
-               feedConfig.markets[index].label[0] != '\0' ? feedConfig.markets[index].label : providerName.c_str());
-    runtime.data.price = source["current_price"].as<float>();
-    runtime.data.change = source["price_change_24h"] | 0.0f;
-    runtime.data.changePercent = source["price_change_percentage_24h"] | 0.0f;
-    return true;
-}
-
-bool syncMarket(uint8_t index, String *error) {
-    if (index >= DASHBOARD_MARKET_COUNT) {
-        if (error != nullptr) {
-            *error = "Market slot out of range";
-        }
-        return false;
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-        if (error != nullptr) {
-            *error = "WiFi disconnected";
-        }
-        return false;
-    }
-
-    if (!feedsMarketConfigured(index)) {
-        if (error != nullptr) {
-            *error = "Market feed not configured";
-        }
-        return false;
-    }
-
-    MarketFeedRuntime &runtime = feedRuntime.markets[index];
-    runtime.syncing = true;
-    runtime.lastAttemptMs = millis();
-    runtime.lastError[0] = '\0';
-
-    bool success = false;
-    String requestError;
-    if (feedConfig.markets[index].source == MARKET_FEED_FINNHUB) {
-        success = syncFinnhubMarket(index, &requestError);
-    } else if (feedConfig.markets[index].source == MARKET_FEED_COINGECKO) {
-        success = syncCoinGeckoMarket(index, &requestError);
-    } else {
-        requestError = "Market feed not configured";
-    }
-
-    runtime.syncing = false;
-    if (!success) {
-        copyString(runtime.lastError, sizeof(runtime.lastError), requestError.c_str());
-        if (error != nullptr) {
-            *error = requestError;
-        }
-        return false;
-    }
-
-    runtime.hasData = true;
-    runtime.lastSuccessMs = millis();
-    runtime.lastError[0] = '\0';
-    logPrintf("Market sync OK: slot=%u symbol=%s price=%.2f",
-              index,
-              runtime.data.symbol,
-              runtime.data.price);
-    return true;
-}
-
-void applyProvidersObject(JsonObjectConst providers) {
-    if (providers.isNull()) {
-        return;
-    }
-
-    if (!providers["finnhubApiKey"].isNull()) {
-        copyString(feedConfig.finnhubApiKey, sizeof(feedConfig.finnhubApiKey), providers["finnhubApiKey"]);
-    }
-}
-
 void applyWeatherObject(JsonObjectConst weather) {
     if (weather.isNull()) {
         return;
@@ -1869,106 +997,10 @@ void applyWeatherObject(JsonObjectConst weather) {
     }
 }
 
-void applyMarketsArray(JsonArrayConst markets) {
-    if (markets.isNull()) {
-        return;
-    }
-
-    uint8_t index = 0;
-    for (JsonObjectConst market : markets) {
-        if (index >= DASHBOARD_MARKET_COUNT) {
-            break;
-        }
-
-        if (!market["source"].isNull()) {
-            feedConfig.markets[index].source = marketSourceFromVariant(market["source"]);
-        }
-        if (!market["symbol"].isNull()) {
-            copyString(feedConfig.markets[index].symbol, sizeof(feedConfig.markets[index].symbol), market["symbol"]);
-        }
-        if (!market["label"].isNull()) {
-            copyString(feedConfig.markets[index].label, sizeof(feedConfig.markets[index].label), market["label"]);
-        }
-        if (!market["currency"].isNull()) {
-            copyString(feedConfig.markets[index].currency, sizeof(feedConfig.markets[index].currency), market["currency"]);
-        }
-        if (!market["refreshMinutes"].isNull()) {
-            feedConfig.markets[index].refreshMinutes = market["refreshMinutes"].as<uint16_t>();
-        }
-
-        ++index;
-    }
-}
-
-void applyHomeAssistantObject(JsonObjectConst homeAssistant) {
-    if (homeAssistant.isNull()) {
-        return;
-    }
-
-    if (!homeAssistant["enabled"].isNull()) {
-        feedConfig.homeAssistant.enabled = homeAssistant["enabled"].as<bool>();
-    }
-    if (!homeAssistant["baseUrl"].isNull()) {
-        copyString(feedConfig.homeAssistant.baseUrl,
-                   sizeof(feedConfig.homeAssistant.baseUrl),
-                   homeAssistant["baseUrl"]);
-    }
-    if (!homeAssistant["token"].isNull()) {
-        copyString(feedConfig.homeAssistant.token,
-                   sizeof(feedConfig.homeAssistant.token),
-                   homeAssistant["token"]);
-    }
-    if (!homeAssistant["tlsMode"].isNull()) {
-        feedConfig.homeAssistant.tlsMode = homeAssistantTlsModeFromVariant(homeAssistant["tlsMode"]);
-    }
-    if (!homeAssistant["fingerprint"].isNull()) {
-        copyString(feedConfig.homeAssistant.fingerprint,
-                   sizeof(feedConfig.homeAssistant.fingerprint),
-                   homeAssistant["fingerprint"]);
-    }
-    if (!homeAssistant["refreshMinutes"].isNull()) {
-        feedConfig.homeAssistant.refreshMinutes = homeAssistant["refreshMinutes"].as<uint16_t>();
-    }
-
-    JsonArrayConst slots = homeAssistant["slots"].as<JsonArrayConst>();
-    if (slots.isNull()) {
-        return;
-    }
-
-    uint8_t index = 0;
-    for (JsonObjectConst slot : slots) {
-        if (index >= HOME_ASSISTANT_SLOT_COUNT) {
-            break;
-        }
-
-        if (!slot["enabled"].isNull()) {
-            feedConfig.homeAssistant.slots[index].enabled = slot["enabled"].as<bool>();
-        }
-        if (!slot["entityId"].isNull()) {
-            copyString(feedConfig.homeAssistant.slots[index].entityId,
-                       sizeof(feedConfig.homeAssistant.slots[index].entityId),
-                       slot["entityId"]);
-        }
-        if (!slot["label"].isNull()) {
-            copyString(feedConfig.homeAssistant.slots[index].label,
-                       sizeof(feedConfig.homeAssistant.slots[index].label),
-                       slot["label"]);
-        }
-        if (!slot["unit"].isNull()) {
-            copyString(feedConfig.homeAssistant.slots[index].unit,
-                       sizeof(feedConfig.homeAssistant.slots[index].unit),
-                       slot["unit"]);
-        }
-
-        ++index;
-    }
-}
-
 void applyConfigObject(JsonObjectConst root) {
-    applyProvidersObject(root["providers"].as<JsonObjectConst>());
     applyWeatherObject(root["weather"].as<JsonObjectConst>());
-    applyMarketsArray(root["markets"].as<JsonArrayConst>());
-    applyHomeAssistantObject(root["homeAssistant"].as<JsonObjectConst>());
+    applyRiverObject(root["river"].as<JsonObjectConst>());
+    applyGithubObject(root["github"].as<JsonObjectConst>());
     normalizeConfig();
 }
 
@@ -1994,13 +1026,248 @@ bool syncWeatherIfDue(uint32_t now) {
     return success;
 }
 
-bool syncMarketIfDue(uint8_t index, uint32_t now) {
-    if (index >= DASHBOARD_MARKET_COUNT || !feedsMarketConfigured(index)) {
+// The API reports "점검중" (under maintenance) instead of a number whenever a
+// station is offline, so every reading has to be validated before use.
+bool parseWaterTemperature(const char *raw, float &celsius) {
+    if (raw == nullptr || raw[0] == '\0') {
         return false;
     }
 
-    MarketFeedRuntime &runtime = feedRuntime.markets[index];
-    uint32_t intervalMs = static_cast<uint32_t>(feedConfig.markets[index].refreshMinutes) * 60UL * 1000UL;
+    char *end = nullptr;
+    float value = strtof(raw, &end);
+    if (end == raw || !isfinite(value)) {
+        return false;
+    }
+
+    if (value < -5.0f || value > 45.0f) {
+        return false;
+    }
+
+    celsius = value;
+    return true;
+}
+
+void riverStationRomanised(const char *station, char *out, size_t outSize) {
+    struct StationName {
+        const char *korean;
+        const char *roman;
+    };
+
+    static const StationName kNames[] = {
+        {"선유", "SEONYU"},
+        {"노량진", "NORYANGJIN"},
+        {"탄천", "TANCHEON"},
+        {"중랑천", "JUNGNANG"},
+        {"안양천", "ANYANG"},
+    };
+
+    for (const StationName &name : kNames) {
+        if (strcmp(station, name.korean) == 0) {
+            copyString(out, outSize, name.roman);
+            return;
+        }
+    }
+
+    copyString(out, outSize, "HAN RIVER");
+}
+
+bool syncRiver(String *error) {
+    RiverFeedRuntime &runtime = feedRuntime.river;
+    runtime.syncing = true;
+    runtime.lastAttemptMs = millis();
+    runtime.lastError[0] = '\0';
+
+    // The shared sample key is limited to five rows per request.
+    bool sampleKey = strcmp(feedConfig.river.apiKey, "sample") == 0;
+    uint8_t rows = sampleKey ? 5 : 10;
+    String url = String("http://openapi.seoul.go.kr:8088/") + feedConfig.river.apiKey +
+                 "/json/WPOSInformationTime/1/" + String(rows) + "/";
+
+    JsonDocument filter;
+    JsonObject filterRow = filter["WPOSInformationTime"]["row"][0].to<JsonObject>();
+    filterRow["MSRSTN_NM"] = true;
+    filterRow["WATT"] = true;
+    filterRow["HR"] = true;
+
+    JsonDocument doc;
+    String requestError;
+    if (!httpGetJson(url, doc, &requestError, &filter)) {
+        runtime.syncing = false;
+        copyString(runtime.lastError, sizeof(runtime.lastError), requestError.c_str());
+        if (error != nullptr) {
+            *error = requestError;
+        }
+        return false;
+    }
+
+    JsonArrayConst entries = doc["WPOSInformationTime"]["row"].as<JsonArrayConst>();
+    if (entries.isNull() || entries.size() == 0) {
+        // An invalid key makes the service answer with an XML error document,
+        // which leaves the filtered result empty.
+        runtime.syncing = false;
+        copyString(runtime.lastError, sizeof(runtime.lastError), "No station rows (check API key)");
+        if (error != nullptr) {
+            *error = runtime.lastError;
+        }
+        return false;
+    }
+
+    // Rows arrive newest first. Prefer the configured station and fall back to
+    // any station that is currently reporting a usable number.
+    const char *chosenStation = nullptr;
+    const char *chosenHour = nullptr;
+    float chosenTemperature = 0.0f;
+    bool found = false;
+
+    for (JsonObjectConst entry : entries) {
+        const char *station = entry["MSRSTN_NM"] | "";
+        float celsius = 0.0f;
+        if (!parseWaterTemperature(entry["WATT"] | "", celsius)) {
+            continue;
+        }
+
+        bool preferred = strcmp(station, feedConfig.river.station) == 0;
+        if (!found || preferred) {
+            chosenStation = station;
+            chosenHour = entry["HR"] | "";
+            chosenTemperature = celsius;
+            found = true;
+        }
+
+        if (preferred) {
+            break;
+        }
+    }
+
+    if (!found) {
+        runtime.syncing = false;
+        copyString(runtime.lastError, sizeof(runtime.lastError), "All stations under maintenance");
+        if (error != nullptr) {
+            *error = runtime.lastError;
+        }
+        return false;
+    }
+
+    memset(&runtime.data, 0, sizeof(runtime.data));
+    riverStationRomanised(chosenStation, runtime.data.station, sizeof(runtime.data.station));
+    copyString(runtime.data.observedAt, sizeof(runtime.data.observedAt), chosenHour != nullptr ? chosenHour : "");
+    runtime.data.temperature = chosenTemperature;
+    runtime.data.hasTemperature = true;
+
+    runtime.hasData = true;
+    runtime.syncing = false;
+    runtime.lastSuccessMs = millis();
+    runtime.lastError[0] = '\0';
+    logPrintf("River sync OK: %s %.1fC", runtime.data.station, runtime.data.temperature);
+    return true;
+}
+
+// A stream of "STAR torvalds/linux" reads as if the same repository is being
+// starred over and over. Showing the running total makes it obvious that each
+// event is one person adding to a large number. Only fetched for star events,
+// so it costs one extra call on the events that would otherwise say nothing.
+bool fetchStarCount(const char *repo, String &formatted) {
+    if (repo == nullptr || strchr(repo, '/') == nullptr) {
+        return false;
+    }
+
+    JsonDocument filter;
+    filter["stargazers_count"] = true;
+
+    HttpJsonRequestOptions options = {};
+    if (feedConfig.github.token[0] != '\0') {
+        options.authorizationBearer = feedConfig.github.token;
+    }
+
+    JsonDocument doc;
+    String url = String("https://api.github.com/repos/") + repo;
+    if (!httpGetJson(url, doc, nullptr, &filter, &options)) {
+        return false;
+    }
+
+    if (doc["stargazers_count"].isNull()) {
+        return false;
+    }
+
+    long stars = doc["stargazers_count"].as<long>();
+    String digits = String(stars);
+    formatted = "";
+    for (int index = 0; index < static_cast<int>(digits.length()); ++index) {
+        if (index > 0 && ((digits.length() - index) % 3) == 0) {
+            formatted += ',';
+        }
+        formatted += digits.charAt(index);
+    }
+    formatted += " stars";
+    return true;
+}
+
+
+// GitHub timestamps are ISO 8601 in UTC. Converting here keeps the display code
+// free of date handling and lets the age be recomputed as the screen redraws.
+uint32_t parseGithubTimestamp(const char *value) {
+    if (value == nullptr) {
+        return 0;
+    }
+
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    if (sscanf(value, "%d-%d-%dT%d:%d:%dZ", &year, &month, &day, &hour, &minute, &second) != 6) {
+        return 0;
+    }
+
+    // Days from the civil epoch, per Howard Hinnant's algorithm.
+    int shiftedYear = year - (month <= 2 ? 1 : 0);
+    int era = (shiftedYear >= 0 ? shiftedYear : shiftedYear - 399) / 400;
+    unsigned yearOfEra = static_cast<unsigned>(shiftedYear - era * 400);
+    unsigned dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    unsigned dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+    long days = static_cast<long>(era) * 146097 + static_cast<long>(dayOfEra) - 719468;
+
+    return static_cast<uint32_t>((days * 86400L) + (hour * 3600) + (minute * 60) + second);
+}
+
+
+void githubEventKind(const char *type, char *out, size_t outSize) {
+    struct EventKind {
+        const char *type;
+        const char *label;
+    };
+
+    static const EventKind kKinds[] = {
+        {"WatchEvent", "STAR"},
+        {"ForkEvent", "FORK"},
+        {"PushEvent", "PUSH"},
+        {"PullRequestEvent", "PULL REQ"},
+        {"PullRequestReviewEvent", "REVIEW"},
+        {"PullRequestReviewCommentEvent", "REVIEW"},
+        {"IssuesEvent", "ISSUE"},
+        {"IssueCommentEvent", "COMMENT"},
+        {"CommitCommentEvent", "COMMENT"},
+        {"CreateEvent", "CREATE"},
+        {"DeleteEvent", "DELETE"},
+        {"ReleaseEvent", "RELEASE"},
+        {"GollumEvent", "WIKI"},
+        {"PublicEvent", "PUBLIC"},
+        {"MemberEvent", "MEMBER"},
+    };
+
+    for (const EventKind &kind : kKinds) {
+        if (strcmp(type, kind.type) == 0) {
+            copyString(out, outSize, kind.label);
+            return;
+        }
+    }
+
+    copyString(out, outSize, "EVENT");
+}
+
+bool syncRiverIfDue(uint32_t now) {
+    if (!feedsRiverConfigured()) {
+        return false;
+    }
+
+    RiverFeedRuntime &runtime = feedRuntime.river;
+    uint32_t intervalMs = static_cast<uint32_t>(feedConfig.river.refreshMinutes) * 60UL * 1000UL;
     if (runtime.syncing) {
         return false;
     }
@@ -2010,20 +1277,20 @@ bool syncMarketIfDue(uint8_t index, uint32_t now) {
     }
 
     String error;
-    bool success = syncMarket(index, &error);
+    bool success = syncRiver(&error);
     if (!success && error.length() > 0) {
-        logPrintf("Market sync failed: slot=%u error=%s", index, error.c_str());
+        logPrintf("River sync failed: %s", error.c_str());
     }
     return success;
 }
 
-bool syncHomeAssistantIfDue(uint32_t now) {
-    if (!feedsHomeAssistantConfigured()) {
+bool syncGithubIfDue(uint32_t now) {
+    if (!feedsGithubConfigured()) {
         return false;
     }
 
-    HomeAssistantRuntime &runtime = feedRuntime.homeAssistant;
-    uint32_t intervalMs = static_cast<uint32_t>(feedConfig.homeAssistant.refreshMinutes) * 60UL * 1000UL;
+    GithubFeedRuntime &runtime = feedRuntime.github;
+    uint32_t intervalMs = static_cast<uint32_t>(feedConfig.github.refreshMinutes) * 60UL * 1000UL;
     if (runtime.syncing) {
         return false;
     }
@@ -2033,11 +1300,277 @@ bool syncHomeAssistantIfDue(uint32_t now) {
     }
 
     String error;
-    bool success = syncHomeAssistant(&error);
+    bool success = syncGithub(&error);
     if (!success && error.length() > 0) {
-        logPrintf("Home Assistant sync failed: %s", error.c_str());
+        logPrintf("GitHub sync failed: %s", error.c_str());
     }
     return success;
+}
+
+// api.github.com negotiates the TLS max_fragment_length extension, which lets
+// BearSSL work with a 512 byte receive buffer instead of the default 16 kB.
+// The runtime probe that would discover this only runs while the free heap is
+// above kHttpsPreferredFreeHeapBytes, and this build sits close enough to the
+// RAM ceiling that it may never reach that level, so the known result is seeded
+// instead. If GitHub ever stops offering the extension the handshake fails and
+// the feed reports an error rather than exhausting the heap.
+void seedKnownHttpsProfiles() {
+    HttpsHostProfile *profile = findHttpsHostProfile(String("api.github.com"), 443);
+    if (profile == nullptr) {
+        return;
+    }
+
+    profile->probed = true;
+    profile->fragmentLength = 512;
+}
+
+void fillRiverStatusJson(JsonObject root, const RiverFeedRuntime &runtime) {
+    root["syncing"] = runtime.syncing;
+    root["hasData"] = runtime.hasData;
+    root["lastError"] = runtime.lastError;
+    root["lastAttemptAgeSec"] = runtime.lastAttemptMs > 0 ? static_cast<long>((millis() - runtime.lastAttemptMs) / 1000UL) : -1;
+    root["lastSuccessAgeSec"] = runtime.lastSuccessMs > 0 ? static_cast<long>((millis() - runtime.lastSuccessMs) / 1000UL) : -1;
+
+    JsonObject data = root["data"].to<JsonObject>();
+    if (runtime.hasData) {
+        data["station"] = runtime.data.station;
+        data["observedAt"] = runtime.data.observedAt;
+        data["temperature"] = runtime.data.temperature;
+    }
+}
+
+void fillGithubStatusJson(JsonObject root, const GithubFeedRuntime &runtime) {
+    root["syncing"] = runtime.syncing;
+    root["hasData"] = runtime.hasData;
+    root["lastError"] = runtime.lastError;
+    root["lastAttemptAgeSec"] = runtime.lastAttemptMs > 0 ? static_cast<long>((millis() - runtime.lastAttemptMs) / 1000UL) : -1;
+    root["lastSuccessAgeSec"] = runtime.lastSuccessMs > 0 ? static_cast<long>((millis() - runtime.lastSuccessMs) / 1000UL) : -1;
+
+    JsonArray events = root["events"].to<JsonArray>();
+    for (uint8_t index = 0; index < runtime.data.count; ++index) {
+        JsonObject event = events.add<JsonObject>();
+        event["kind"] = runtime.data.events[index].kind;
+        event["repo"] = runtime.data.events[index].repo;
+        event["actor"] = runtime.data.events[index].actor;
+        event["detail"] = runtime.data.events[index].detail;
+    }
+}
+
+void applyRiverObject(JsonObjectConst root) {
+    if (root.isNull()) {
+        return;
+    }
+
+    if (!root["enabled"].isNull()) {
+        feedConfig.river.enabled = root["enabled"].as<bool>();
+    }
+    if (!root["apiKey"].isNull()) {
+        copyString(feedConfig.river.apiKey, sizeof(feedConfig.river.apiKey), root["apiKey"] | "");
+    }
+    if (!root["station"].isNull()) {
+        copyString(feedConfig.river.station, sizeof(feedConfig.river.station), root["station"] | "");
+    }
+    if (!root["refreshMinutes"].isNull()) {
+        feedConfig.river.refreshMinutes = root["refreshMinutes"].as<uint16_t>();
+    }
+}
+
+void applyGithubObject(JsonObjectConst root) {
+    if (root.isNull()) {
+        return;
+    }
+
+    if (!root["enabled"].isNull()) {
+        feedConfig.github.enabled = root["enabled"].as<bool>();
+    }
+    if (!root["useGlobalFeed"].isNull()) {
+        feedConfig.github.useGlobalFeed = root["useGlobalFeed"].as<bool>();
+    }
+    if (!root["token"].isNull()) {
+        copyString(feedConfig.github.token, sizeof(feedConfig.github.token), root["token"] | "");
+    }
+    if (!root["refreshMinutes"].isNull()) {
+        feedConfig.github.refreshMinutes = root["refreshMinutes"].as<uint16_t>();
+    }
+
+    JsonArrayConst repos = root["repos"].as<JsonArrayConst>();
+    if (repos.isNull()) {
+        return;
+    }
+
+    for (uint8_t index = 0; index < GITHUB_REPO_SLOT_COUNT; ++index) {
+        const char *value = index < repos.size() ? (repos[index] | "") : "";
+        copyString(feedConfig.github.repos[index], sizeof(feedConfig.github.repos[index]), value);
+    }
+}
+
+void clearRiverRuntime() {
+    memset(&feedRuntime.river, 0, sizeof(feedRuntime.river));
+}
+
+void clearGithubRuntime() {
+    memset(&feedRuntime.github, 0, sizeof(feedRuntime.github));
+}
+
+uint16_t clampRiverRefresh(uint16_t minutes) {
+    return constrain(minutes, kRiverMinRefreshMinutes, kRiverMaxRefreshMinutes);
+}
+
+uint16_t clampGithubRefresh(uint16_t minutes) {
+    return constrain(minutes, kGithubMinRefreshMinutes, kGithubMaxRefreshMinutes);
+}
+
+bool syncGithub(String *error) {
+    GithubFeedRuntime &runtime = feedRuntime.github;
+    runtime.syncing = true;
+    runtime.lastAttemptMs = millis();
+    runtime.lastError[0] = '\0';
+
+    String url;
+    if (feedConfig.github.useGlobalFeed) {
+        url = "https://api.github.com/events?per_page=3";
+    } else {
+        // Walk the configured repositories one per refresh so a single request
+        // stays small while the page still shows a variety of projects.
+        const char *repo = nullptr;
+        for (uint8_t attempt = 0; attempt < GITHUB_REPO_SLOT_COUNT; ++attempt) {
+            uint8_t index = (runtime.nextRepoIndex + attempt) % GITHUB_REPO_SLOT_COUNT;
+            if (feedConfig.github.repos[index][0] != '\0') {
+                repo = feedConfig.github.repos[index];
+                runtime.nextRepoIndex = (index + 1) % GITHUB_REPO_SLOT_COUNT;
+                break;
+            }
+        }
+
+        if (repo == nullptr) {
+            runtime.syncing = false;
+            copyString(runtime.lastError, sizeof(runtime.lastError), "No repositories configured");
+            if (error != nullptr) {
+                *error = runtime.lastError;
+            }
+            return false;
+        }
+
+        // A slash means a single repository; a bare name is an organisation,
+        // whose feed mixes every repository it owns and so repeats far less.
+        // One event per request either way: a pull-request entry alone can be
+        // several kilobytes, and the JSON parser has to share what little heap
+        // is left once the TLS session has taken its share.
+        bool isRepository = strchr(repo, '/') != nullptr;
+        url = String("https://api.github.com/") + (isRepository ? "repos/" : "orgs/") + repo +
+              "/events?per_page=1";
+    }
+
+    JsonDocument filter;
+    JsonObject filterEntry = filter[0].to<JsonObject>();
+    filterEntry["type"] = true;
+    filterEntry["actor"]["login"] = true;
+    filterEntry["repo"]["name"] = true;
+    filterEntry["payload"]["action"] = true;
+    filterEntry["payload"]["ref"] = true;
+    filterEntry["created_at"] = true;
+
+    HttpJsonRequestOptions options = {};
+    if (feedConfig.github.token[0] != '\0') {
+        options.authorizationBearer = feedConfig.github.token;
+    }
+
+    JsonDocument doc;
+    String requestError;
+    if (!httpGetJson(url, doc, &requestError, &filter, &options)) {
+        runtime.syncing = false;
+        copyString(runtime.lastError, sizeof(runtime.lastError), requestError.c_str());
+        if (error != nullptr) {
+            *error = requestError;
+        }
+        return false;
+    }
+
+    JsonArrayConst entries = doc.as<JsonArrayConst>();
+    if (entries.isNull() || entries.size() == 0) {
+        runtime.syncing = false;
+        copyString(runtime.lastError, sizeof(runtime.lastError), "Empty event list");
+        if (error != nullptr) {
+            *error = runtime.lastError;
+        }
+        return false;
+    }
+
+    memset(&runtime.data, 0, sizeof(runtime.data));
+    for (JsonObjectConst entry : entries) {
+        if (runtime.data.count >= DASHBOARD_GITHUB_EVENT_COUNT) {
+            break;
+        }
+
+        GithubEventEntry &slot = runtime.data.events[runtime.data.count];
+        githubEventKind(entry["type"] | "", slot.kind, sizeof(slot.kind));
+        copyString(slot.repo, sizeof(slot.repo), entry["repo"]["name"] | "");
+        copyString(slot.actor, sizeof(slot.actor), entry["actor"]["login"] | "");
+
+        // "started" (a star) and "created" (a comment or review) only repeat
+        // what the event kind already says, so they are dropped in favour of
+        // the branch name when there is one.
+        slot.createdAt = parseGithubTimestamp(entry["created_at"] | "");
+
+        const char *action = entry["payload"]["action"] | "";
+        const char *ref = entry["payload"]["ref"] | "";
+        bool actionIsInformative = action[0] != '\0' &&
+                                   strcmp(action, "started") != 0 &&
+                                   strcmp(action, "created") != 0;
+        if (actionIsInformative) {
+            copyString(slot.detail, sizeof(slot.detail), action);
+        } else if (ref[0] != '\0') {
+            const char *shortRef = strrchr(ref, '/');
+            copyString(slot.detail, sizeof(slot.detail), shortRef != nullptr ? shortRef + 1 : ref);
+        }
+
+        if (slot.repo[0] != '\0') {
+            runtime.data.count++;
+        }
+    }
+
+    if (runtime.data.count == 0) {
+        runtime.syncing = false;
+        copyString(runtime.lastError, sizeof(runtime.lastError), "No usable events");
+        if (error != nullptr) {
+            *error = runtime.lastError;
+        }
+        return false;
+    }
+
+    // Stars carry no useful action word, so the slot is spent on the total.
+    // The count is only fetched when the repository actually changed: polling
+    // returns the same event for minutes at a time, and each lookup is a second
+    // request against an hourly budget of sixty.
+    static char lastStarRepo[40] = {0};
+    static char lastStarText[32] = {0};
+
+    for (uint8_t index = 0; index < runtime.data.count; ++index) {
+        GithubEventEntry &slot = runtime.data.events[index];
+        if (strcmp(slot.kind, "STAR") != 0 || slot.detail[0] != '\0') {
+            continue;
+        }
+
+        if (strcmp(slot.repo, lastStarRepo) == 0 && lastStarText[0] != '\0') {
+            copyString(slot.detail, sizeof(slot.detail), lastStarText);
+            break;
+        }
+
+        String starText;
+        if (fetchStarCount(slot.repo, starText)) {
+            copyString(slot.detail, sizeof(slot.detail), starText.c_str());
+            copyString(lastStarRepo, sizeof(lastStarRepo), slot.repo);
+            copyString(lastStarText, sizeof(lastStarText), starText.c_str());
+        }
+        break;
+    }
+
+    runtime.hasData = true;
+    runtime.syncing = false;
+    runtime.lastSuccessMs = millis();
+    runtime.lastError[0] = '\0';
+    logPrintf("GitHub sync OK: %u events (%s)", runtime.data.count, runtime.data.events[0].repo);
+    return true;
 }
 
 }  // namespace
@@ -2050,6 +1583,7 @@ void feedsResetToDefaults() {
 
 void feedsInit() {
     feedsResetToDefaults();
+    seedKnownHttpsProfiles();
     if (!feedsLoadConfig()) {
         feedsSaveConfig();
     }
@@ -2100,16 +1634,6 @@ bool feedsPreviewConfigJson(const String &json, String *error) {
         clearWeatherRuntime();
     }
 
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        if (marketIdentityChanged(previousConfig.markets[index], feedConfig.markets[index])) {
-            clearMarketRuntime(index);
-        }
-    }
-
-    if (homeAssistantIdentityChanged(previousConfig.homeAssistant, feedConfig.homeAssistant)) {
-        clearHomeAssistantRuntime();
-    }
-
     feedDraftActive = !feedConfigEquals(feedConfig, savedFeedConfig);
     return true;
 }
@@ -2138,16 +1662,6 @@ void feedsDiscardDraftChanges() {
         clearWeatherRuntime();
     }
 
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        if (marketIdentityChanged(previousConfig.markets[index], feedConfig.markets[index])) {
-            clearMarketRuntime(index);
-        }
-    }
-
-    if (homeAssistantIdentityChanged(previousConfig.homeAssistant, feedConfig.homeAssistant)) {
-        clearHomeAssistantRuntime();
-    }
-
     feedDraftActive = false;
 }
 
@@ -2170,8 +1684,8 @@ bool feedsSyncNow(const char *scope, String *error) {
     scopeValue.toLowerCase();
 
     bool wantWeather = scopeValue == "all" || scopeValue == "weather";
-    bool wantMarkets = scopeValue == "all" || scopeValue == "markets";
-    bool wantHomeAssistant = scopeValue == "all" || scopeValue == "home" || scopeValue == "home-assistant";
+    bool wantRiver = scopeValue == "all" || scopeValue == "river";
+    bool wantGithub = scopeValue == "all" || scopeValue == "github";
 
     bool anyConfigured = false;
     bool anySuccess = false;
@@ -2185,37 +1699,29 @@ bool feedsSyncNow(const char *scope, String *error) {
         if (!success && firstError.isEmpty()) {
             firstError = weatherError;
         }
+        yield();
     }
 
-    if (wantMarkets) {
-        for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-            if (feedConfig.markets[index].source != MARKET_FEED_FINNHUB &&
-                feedConfig.markets[index].source != MARKET_FEED_COINGECKO) {
-                continue;
-            }
-            if (!feedsMarketConfigured(index)) {
-                continue;
-            }
-
-            anyConfigured = true;
-            String marketError;
-            bool success = syncMarket(index, &marketError);
-            anySuccess = anySuccess || success;
-            if (!success && firstError.isEmpty()) {
-                firstError = marketError;
-            }
-            yield();
-        }
-    }
-
-    if (wantHomeAssistant && feedsHomeAssistantConfigured()) {
+    if (wantRiver && feedsRiverConfigured()) {
         anyConfigured = true;
-        String homeAssistantError;
-        bool success = syncHomeAssistant(&homeAssistantError);
+        String riverError;
+        bool success = syncRiver(&riverError);
         anySuccess = anySuccess || success;
         if (!success && firstError.isEmpty()) {
-            firstError = homeAssistantError;
+            firstError = riverError;
         }
+        yield();
+    }
+
+    if (wantGithub && feedsGithubConfigured()) {
+        // Opening a TLS session while the web server still holds its request
+        // buffers is what made manual syncs fail on a device this tight for
+        // heap. Clearing the timer hands the work to the background loop, which
+        // runs a moment later with the memory to spare.
+        anyConfigured = true;
+        anySuccess = true;
+        feedRuntime.github.lastAttemptMs = 0;
+        logPrint(F("GitHub sync queued for the next loop pass"));
     }
 
     if (!anyConfigured) {
@@ -2277,13 +1783,10 @@ void feedsLoop() {
     }
 
     bool anyUpdated = syncWeatherIfDue(now);
-
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        anyUpdated = syncMarketIfDue(index, now) || anyUpdated;
-        yield();
-    }
-
-    anyUpdated = syncHomeAssistantIfDue(now) || anyUpdated;
+    yield();
+    anyUpdated = syncRiverIfDue(now) || anyUpdated;
+    yield();
+    anyUpdated = syncGithubIfDue(now) || anyUpdated;
 
     if (anyUpdated) {
         logPrint(F("Feeds refreshed"));
@@ -2292,56 +1795,6 @@ void feedsLoop() {
 
 uint8_t feedsWeatherSource() {
     return feedConfig.weather.source;
-}
-
-uint8_t feedsMarketSource(uint8_t index) {
-    if (index >= DASHBOARD_MARKET_COUNT) {
-        return MARKET_FEED_DISABLED;
-    }
-
-    return feedConfig.markets[index].source;
-}
-
-bool feedsHomeAssistantConfigured() {
-    if (!feedConfig.homeAssistant.enabled) {
-        return false;
-    }
-
-    if (!baseUrlValid(String(feedConfig.homeAssistant.baseUrl))) {
-        return false;
-    }
-
-    if (feedConfig.homeAssistant.token[0] == '\0') {
-        return false;
-    }
-
-    if (String(feedConfig.homeAssistant.baseUrl).startsWith("https://") &&
-        feedConfig.homeAssistant.tlsMode == HOME_ASSISTANT_TLS_FINGERPRINT &&
-        feedConfig.homeAssistant.fingerprint[0] == '\0') {
-        return false;
-    }
-
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        if (homeAssistantSlotConfigured(feedConfig.homeAssistant.slots[index])) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool feedsHasHomeAssistantData() {
-    return feedRuntime.homeAssistant.hasData;
-}
-
-const HomeAssistantSlotData* feedsHomeAssistantSlotData(uint8_t index) {
-    if (index >= HOME_ASSISTANT_SLOT_COUNT) {
-        return nullptr;
-    }
-
-    return feedRuntime.homeAssistant.slots[index].hasData
-               ? &feedRuntime.homeAssistant.slots[index]
-               : nullptr;
 }
 
 bool feedsWeatherConfigured() {
@@ -2358,25 +1811,8 @@ bool feedsWeatherConfigured() {
     return query.length() >= 2;
 }
 
-bool feedsMarketConfigured(uint8_t index) {
-    if (index >= DASHBOARD_MARKET_COUNT) {
-        return false;
-    }
-
-    const MarketFeedConfig &market = feedConfig.markets[index];
-    if (market.source != MARKET_FEED_FINNHUB && market.source != MARKET_FEED_COINGECKO) {
-        return false;
-    }
-
-    return market.symbol[0] != '\0';
-}
-
 bool feedsHasWeatherData() {
     return feedRuntime.weather.hasData;
-}
-
-bool feedsHasMarketData(uint8_t index) {
-    return index < DASHBOARD_MARKET_COUNT && feedRuntime.markets[index].hasData;
 }
 
 bool feedsWeatherUsesFahrenheit() {
@@ -2387,10 +1823,58 @@ const WeatherData* feedsWeatherData() {
     return feedRuntime.weather.hasData ? &feedRuntime.weather.data : nullptr;
 }
 
-const MarketData* feedsMarketData(uint8_t index) {
-    if (index >= DASHBOARD_MARKET_COUNT || !feedRuntime.markets[index].hasData) {
+
+bool feedsRiverConfigured() {
+    return feedConfig.river.enabled && feedConfig.river.apiKey[0] != '\0';
+}
+
+bool feedsHasRiverData() {
+    return feedRuntime.river.hasData;
+}
+
+const RiverData* feedsRiverData() {
+    if (!feedRuntime.river.hasData) {
         return nullptr;
     }
 
-    return &feedRuntime.markets[index].data;
+    return &feedRuntime.river.data;
+}
+
+bool feedsGithubConfigured() {
+    if (!feedConfig.github.enabled) {
+        return false;
+    }
+
+    if (feedConfig.github.useGlobalFeed) {
+        return true;
+    }
+
+    for (uint8_t index = 0; index < GITHUB_REPO_SLOT_COUNT; ++index) {
+        if (feedConfig.github.repos[index][0] != '\0') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool feedsHasGithubData() {
+    return feedRuntime.github.hasData && feedRuntime.github.data.count > 0;
+}
+
+const GithubData* feedsGithubData() {
+    if (!feedsHasGithubData()) {
+        return nullptr;
+    }
+
+    return &feedRuntime.github.data;
+}
+
+void feedsGithubAdvanceCursor() {
+    GithubData &data = feedRuntime.github.data;
+    if (data.count == 0) {
+        return;
+    }
+
+    data.cursor = (data.cursor + 1) % data.count;
 }

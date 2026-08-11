@@ -179,10 +179,10 @@ bool loadAuthConfig() {
 String generateDefaultPassword() {
     const char digits[] = "0123456789";
     String password;
-    password.reserve(10);
+    password.reserve(4);
 
     randomSeed(ESP.getChipId() ^ micros() ^ ESP.getCycleCount());
-    for (uint8_t index = 0; index < 10; ++index) {
+    for (uint8_t index = 0; index < 4; ++index) {
         password += digits[random(0, static_cast<int>(sizeof(digits) - 1))];
     }
 

@@ -3,22 +3,16 @@
 
 #include <Arduino.h>
 
-#define DASHBOARD_MARKET_COUNT 3
-#define DASHBOARD_WORLD_CLOCK_COUNT 2
+#define DASHBOARD_GITHUB_EVENT_COUNT 2
 #define DASHBOARD_CONFIG_PATH "/dashboard-config.json"
 #define DASHBOARD_DATA_PATH "/dashboard-data.json"
-#define DASHBOARD_CONFIG_VERSION 3
+#define DASHBOARD_CONFIG_VERSION 5
 
 enum DashboardPageId : uint8_t {
     DASHBOARD_PAGE_CLOCK = 0,
     DASHBOARD_PAGE_WEATHER,
-    DASHBOARD_PAGE_MARKETS,
-    DASHBOARD_PAGE_HOME,
-    DASHBOARD_PAGE_FOCUS,
-    DASHBOARD_PAGE_WORLD,
-    DASHBOARD_PAGE_EVENT,
-    DASHBOARD_PAGE_QUOTE,
-    DASHBOARD_PAGE_STATUS,
+    DASHBOARD_PAGE_RIVER,
+    DASHBOARD_PAGE_GITHUB,
     DASHBOARD_PAGE_COUNT
 };
 
@@ -38,45 +32,25 @@ struct WeatherData {
     int rainChance;
 };
 
-struct MarketData {
-    bool enabled;
-    char symbol[12];
-    char label[16];
-    float price;
-    float change;
-    float changePercent;
+struct RiverData {
+    char station[16];      // romanised station name, e.g. "SEONYU"
+    char observedAt[8];    // hour reported by the API, e.g. "13:00"
+    float temperature;     // water temperature in Celsius
+    bool hasTemperature;   // false while the station reports maintenance
 };
 
-struct FocusData {
-    char label[24];
-    bool running;
-    bool breakMode;
-    uint16_t durationMinutes;
-    uint32_t remainingSeconds;
-    uint32_t updatedAtEpoch;
+struct GithubEventEntry {
+    char kind[12];         // STAR / FORK / PR / ISSUE / PUSH / COMMENT
+    char repo[40];         // owner/name
+    char actor[24];
+    char detail[32];       // star total, branch, PR action, ...
+    uint32_t createdAt;    // UTC epoch, so the age can be recomputed on screen
 };
 
-struct WorldClockData {
-    bool enabled;
-    char label[16];
-    long offsetSeconds;
-};
-
-struct EventData {
-    char title[32];
-    char subtitle[24];
-    uint32_t remainingSeconds;
-    uint32_t updatedAtEpoch;
-};
-
-struct QuoteData {
-    char text[96];
-    char author[24];
-};
-
-struct StatusData {
-    char line1[32];
-    char line2[32];
+struct GithubData {
+    GithubEventEntry events[DASHBOARD_GITHUB_EVENT_COUNT];
+    uint8_t count;
+    uint8_t cursor;        // advances every time the page is shown
 };
 
 struct DashboardConfig {
@@ -108,12 +82,9 @@ struct DashboardConfig {
 
 struct DashboardData {
     WeatherData weather;
-    MarketData markets[DASHBOARD_MARKET_COUNT];
-    FocusData focus;
-    WorldClockData worldClocks[DASHBOARD_WORLD_CLOCK_COUNT];
-    EventData event;
-    QuoteData quote;
-    StatusData status;
+    // River and GitHub readings live in the feed runtime rather than here; the
+    // pages render straight from it, and this device has no RAM to spare for a
+    // second copy.
 };
 
 extern DashboardConfig dashboardConfig;
@@ -141,8 +112,6 @@ uint8_t dashboardNextEnabledPage(uint8_t currentPage);
 bool dashboardPageEnabled(uint8_t pageId);
 const char* dashboardPageName(uint8_t pageId);
 uint32_t dashboardCurrentEpoch();
-int32_t dashboardFocusRemainingSeconds();
-int32_t dashboardEventRemainingSeconds();
 bool dashboardNightModeActive();
 int dashboardEffectiveBrightness(int dayBrightness);
 

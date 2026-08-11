@@ -262,6 +262,26 @@ void registerProtectedRoute(const char *uri, HTTPMethod method, SimpleHandler ha
     });
 }
 
+// True while the device has no usable network of its own and is offering the
+// setup AP. The admin account only means anything on a configured network, so
+// there is no session to require here; the sole purpose of this state is to let
+// someone nearby (re)configure WiFi. Endpoints registered below are therefore
+// open in this state and behind auth again once the device is on a network.
+// This is what keeps a screen-broken device recoverable over the air.
+bool webserverInSetupMode() {
+    return wifiFailsafeMode || displayState.apMode;
+}
+
+void registerSetupRoute(const char *uri, HTTPMethod method, SimpleHandler handler) {
+    server.on(uri, method, [handler]() {
+        if (!webserverInSetupMode() && !ensureAuthenticatedRequest()) {
+            return;
+        }
+
+        handler();
+    });
+}
+
 bool parseJsonBody(JsonDocument &doc, String *error = nullptr) {
     if (!server.hasArg("plain")) {
         if (error != nullptr) {
@@ -558,7 +578,7 @@ void failWiFiConnectTask(const __FlashStringHelper *reason) {
     WiFi.disconnect(true);
     delay(100);
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(WIFI_AP_NAME, apPassword.c_str());
+    WiFi.softAP(WIFI_AP_NAME);  // open - matches setupWiFi so a failed try still leaves a joinable setup AP
     wifiFailsafeMode = true;
     displayShowAPScreen(WIFI_AP_NAME, apPassword.c_str(), WiFi.softAPIP().toString().c_str());
 }
@@ -603,7 +623,7 @@ void webserverApplyEffectiveBrightness(bool syncPreference) {
     applyEffectiveBrightness(syncPreference);
 }
 
-void handleAppJson() {
+String buildAppJson() {
     char hostName[SETTINGS_HOSTNAME_LENGTH];
     char defaultDeviceName[SETTINGS_DEVICE_NAME_LENGTH];
     copyConfiguredHostname(hostName, sizeof(hostName));
@@ -620,8 +640,33 @@ void handleAppJson() {
     json += "\"displayDraft\":" + String(displayHasDraftChanges() ? "true" : "false") + ",";
     json += "\"networkBusy\":" + String(webserverHasPendingNetworkAction() ? "true" : "false");
     json += "}";
-    sendJsonResponse(200, json);
+    return json;
 }
+
+String buildSpaceJson() {
+    FSInfo fsInfo;
+    LittleFS.info(fsInfo);
+
+    String json = "{";
+    json += "\"total\":" + String(fsInfo.totalBytes) + ",";
+    json += "\"free\":" + String(fsInfo.totalBytes - fsInfo.usedBytes);
+    json += "}";
+    return json;
+}
+
+String buildVersionJson() {
+    char hostName[SETTINGS_HOSTNAME_LENGTH];
+    copyConfiguredHostname(hostName, sizeof(hostName));
+
+    String json = "{";
+    json += "\"version\":\"" + String(FIRMWARE_VERSION_STRING) + "\",";
+    json += "\"deviceName\":\"" + String(appSettings.deviceName) + "\",";
+    json += "\"hostName\":\"" + String(hostName) + "\"";
+    json += "}";
+    return json;
+}
+
+void handleAppJson() { sendJsonResponse(200, buildAppJson()); }
 
 void handleDashboardJson() {
     String json;
@@ -635,29 +680,35 @@ void handleFeedsJson() {
     sendJsonResponse(200, json);
 }
 
-void handleSpaceJson() {
-    FSInfo fsInfo;
-    LittleFS.info(fsInfo);
-
-    String json = "{";
-    json += "\"total\":" + String(fsInfo.totalBytes) + ",";
-    json += "\"free\":" + String(fsInfo.totalBytes - fsInfo.usedBytes);
-    json += "}";
-    sendJsonResponse(200, json);
-}
+void handleSpaceJson() { sendJsonResponse(200, buildSpaceJson()); }
 
 void handleBrtJson() {
     sendJsonResponse(200, "{\"brt\":\"" + String(currentBrightness) + "\"}");
 }
 
-void handleVersionJson() {
-    char hostName[SETTINGS_HOSTNAME_LENGTH];
-    copyConfiguredHostname(hostName, sizeof(hostName));
+void handleVersionJson() { sendJsonResponse(200, buildVersionJson()); }
 
-    String json = "{";
-    json += "\"version\":\"" + String(FIRMWARE_VERSION_STRING) + "\",";
-    json += "\"deviceName\":\"" + String(appSettings.deviceName) + "\",";
-    json += "\"hostName\":\"" + String(hostName) + "\"";
+// One request for the whole initial state. The browser used to fire five
+// concurrent fetches on load; this device serves one connection at a time, so
+// on a weak link any single request stalling on a retransmit held up the whole
+// page - and five simultaneous sockets sometimes exhausted the server and
+// dropped one outright. Folding them into a single object means one round trip.
+void handleStateJson() {
+    String dashboard;
+    dashboardBuildFullJson(dashboard);
+    String feeds;
+    feedsBuildStateJson(feeds);
+
+    String json = "{\"app\":";
+    json += buildAppJson();
+    json += ",\"dashboard\":";
+    json += dashboard;
+    json += ",\"feeds\":";
+    json += feeds;
+    json += ",\"version\":";
+    json += buildVersionJson();
+    json += ",\"space\":";
+    json += buildSpaceJson();
     json += "}";
     sendJsonResponse(200, json);
 }
@@ -726,7 +777,7 @@ void handleAuthLogout() {
 void handleAuthReveal() {
     if (!authCanRevealPassword()) {
         sendTextResponse(409,
-                         "Custom or older passwords cannot be displayed. If you forgot it, factory reset with 5 quick power cycles.");
+                         "Custom or older passwords cannot be displayed. If you forgot it, factory reset with 10 quick power cycles.");
         return;
     }
 
@@ -1129,34 +1180,79 @@ void handleOTAForm() {
     server.send_P(200, "text/html", ota_html);
 }
 
+bool otaStrict = false;
+
 void handleOTAUpload() {
     HTTPUpload &upload = server.upload();
 
     if (upload.status == UPLOAD_FILE_START) {
         displayShowMessage("OTA Update...");
         uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-        if (!Update.begin(maxSketchSpace)) {
+        // Never stage more than the bootable application slot holds (0x001000..
+        // 0x100000). A larger image could not boot anyway, and the free-space
+        // figure alone allows far more than the slot, so bound it explicitly.
+        constexpr uint32_t kAppSlotSize = 0xFF000u;
+        if (maxSketchSpace > kAppSlotSize) {
+            maxSketchSpace = kAppSlotSize;
+        }
+        uint32_t declared = server.hasArg("size") ? server.arg("size").toInt() : 0;
+        otaStrict = declared > 0 && declared <= maxSketchSpace;
+        if (!Update.begin(otaStrict ? declared : maxSketchSpace)) {
             Update.printError(Serial);
+            return;
+        }
+
+        // A checksum turns a truncated upload into a clean refusal. Without one
+        // the update is accepted on whatever arrived, which is how a half
+        // written image ends up in the boot slot and bricks the device.
+        if (server.hasArg("md5")) {
+            String expected = server.arg("md5");
+            expected.trim();
+            expected.toLowerCase();
+            if (expected.length() == 32 && Update.setMD5(expected.c_str())) {
+                logPrintf("OTA expecting md5 %s", expected.c_str());
+            } else {
+                logPrint(F("OTA rejected: malformed md5"));
+                Update.end(false);
+            }
+        } else {
+            logPrint(F("OTA without md5 - size check only"));
         }
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
             Update.printError(Serial);
         }
     } else if (upload.status == UPLOAD_FILE_END) {
-        if (Update.end(true)) {
+        // No "evenIfRemaining": the write must be complete, and the checksum
+        // must match, or nothing is committed.
+        if (Update.end(!otaStrict)) {
             displayShowMessage("OTA complete");
+            logPrintf("OTA verified, %u bytes", upload.totalSize);
         } else {
             Update.printError(Serial);
             displayShowMessage("OTA failed");
+            logPrint(F("OTA refused - image not committed"));
         }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        Update.end(false);
+        displayShowMessage("OTA aborted");
+        logPrint(F("OTA aborted by client"));
     }
 }
 
 void handleOTADone() {
-    bool shouldReboot = !Update.hasError();
+    // Only a finished, verified image earns a reboot.
+    bool shouldReboot = Update.isFinished() && !Update.hasError();
     sendTextResponse(200, shouldReboot ? "OK - Rebooting..." : "FAIL");
 
     if (shouldReboot) {
+        // An OTA reboot is intentional, not a crash. Clear the boot-failure
+        // counter first so a successful update - including the bootstrap->full
+        // install hop and every later OTA - never counts toward crash-loop
+        // recovery. Without this, the reboots a normal install goes through
+        // could accumulate to the recovery threshold and boot the fresh device
+        // straight into recovery mode with feed sync and NTP disabled.
+        bootCounterReset();
         delay(1000);
         ESP.restart();
     }
@@ -1164,6 +1260,15 @@ void handleOTADone() {
 
 void handleLog() {
     sendTextResponse(200, logGetAll());
+}
+
+void handleReboot() {
+    sendTextResponse(200, "Rebooting");
+    // A user-requested reboot is intentional, so it must not count as a boot
+    // failure either.
+    bootCounterReset();
+    delay(200);
+    ESP.restart();
 }
 
 void handleWiFiScan() {
@@ -1209,7 +1314,52 @@ void handleWiFiConnect() {
     sendTextResponse(202, "Connection started. Device will restart if successful.");
 }
 
+// Self-contained WiFi setup page for the AP/recovery state. It depends on
+// neither the bundled SPA nor a login, so it works even when the only secret a
+// device would otherwise need is trapped on a screen that no longer displays.
+static const char kSetupHtml[] PROGMEM =
+    "<!doctype html><html><head><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>SmallTV WiFi Setup</title><style>"
+    "body{font-family:system-ui,sans-serif;max-width:26rem;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}"
+    "h2{font-weight:600}select,input,button{width:100%;box-sizing:border-box;padding:.6rem;margin:.3rem 0;"
+    "border-radius:.4rem;border:1px solid #444;background:#1c1c1c;color:#eee;font-size:1rem}"
+    "button{background:#2d6cdf;border:0;font-weight:600;cursor:pointer}#s{margin-top:.8rem;min-height:1.2rem;color:#9cf}"
+    "</style></head><body><h2>WiFi Setup</h2>"
+    "<button onclick=scan()>Scan networks</button>"
+    "<select id=n><option value=''>-- pick a network --</option></select>"
+    "<input id=ssid placeholder='or type SSID'>"
+    "<input id=pw type=password placeholder='WiFi password'>"
+    "<button onclick=save()>Connect</button><div id=s></div>"
+    "<script>"
+    "var S=document.getElementById('s');"
+    "function scan(){S.textContent='Scanning...';fetch('/scan').then(r=>r.json()).then(a=>{"
+    "var n=document.getElementById('n');n.length=1;a.sort((x,y)=>y.rssi-x.rssi).forEach(w=>{"
+    "if(!w.ssid)return;var o=document.createElement('option');o.value=w.ssid;o.textContent=w.ssid+' ('+w.rssi+')';n.add(o)});"
+    "S.textContent=a.length+' networks';}).catch(e=>S.textContent='Scan failed');}"
+    "document.getElementById('n').onchange=function(){document.getElementById('ssid').value=this.value;};"
+    "function save(){var s=document.getElementById('ssid').value||document.getElementById('n').value;"
+    "if(!s){S.textContent='Enter a network';return;}S.textContent='Connecting...';"
+    "fetch('/connect',{method:'POST',headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({ssid:s,password:document.getElementById('pw').value})})"
+    ".then(r=>r.text()).then(t=>{S.textContent=t+' The device will restart if it works.';})"
+    ".catch(e=>S.textContent='Request failed');}"
+    "</script></body></html>";
+
+void handleSetupPage() {
+    prepareNoStoreHeaders();
+    server.send_P(200, "text/html", kSetupHtml);
+}
+
 void handleRoot() {
+    // In the setup AP state, serve the self-contained setup page instead of the
+    // SPA: the SPA gates everything behind a login whose password may only exist
+    // on a failed screen, which is exactly the lock-out this avoids.
+    if (webserverInSetupMode()) {
+        handleSetupPage();
+        return;
+    }
+
     if (requestHasValidSession()) {
         attachSessionCookie(kAuthSessionMaxAgeSec);
     } else if (server.hasHeader("Cookie")) {
@@ -1234,6 +1384,7 @@ void webserverInit() {
     server.on("/auth/logout", HTTP_POST, handleAuthLogout);
     server.on("/auth/reveal", HTTP_POST, handleAuthReveal);
 
+    registerProtectedRoute("/state.json", HTTP_GET, handleStateJson);
     registerProtectedRoute("/app.json", HTTP_GET, handleAppJson);
     registerProtectedRoute("/dashboard.json", HTTP_GET, handleDashboardJson);
     registerProtectedRoute("/feeds.json", HTTP_GET, handleFeedsJson);
@@ -1242,10 +1393,14 @@ void webserverInit() {
     registerProtectedRoute("/version.json", HTTP_GET, handleVersionJson);
     registerProtectedRoute("/delete", HTTP_POST, handleDelete);
     registerProtectedRoute("/log", HTTP_GET, handleLog);
+    registerProtectedRoute("/reboot", HTTP_POST, handleReboot);
     registerProtectedRoute("/reconfigurewifi", HTTP_POST, handleReconfigureWiFi);
     registerProtectedRoute("/factoryreset", HTTP_POST, handleFactoryReset);
-    registerProtectedRoute("/scan", HTTP_GET, handleWiFiScan);
-    registerProtectedRoute("/connect", HTTP_POST, handleWiFiConnect);
+    // Setup routes: open only while offering the setup AP, so a device with no
+    // network (or a dead screen) can still be pointed at a WiFi network.
+    registerSetupRoute("/setup", HTTP_GET, handleSetupPage);
+    registerSetupRoute("/scan", HTTP_GET, handleWiFiScan);
+    registerSetupRoute("/connect", HTTP_POST, handleWiFiConnect);
     registerProtectedRoute("/test", HTTP_POST, handleTestCard);
     registerProtectedRoute("/image/show", HTTP_POST, handleImageShow);
     registerProtectedRoute("/dashboard/config", HTTP_POST, handleDashboardConfigSave);

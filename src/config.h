@@ -33,7 +33,10 @@
 
 // Update intervals
 #define SCROLL_INTERVAL 30
-#define DISPLAY_UPDATE_INTERVAL 1000
+// Five frames a second: enough for the river page's water to read as moving
+// rather than stepping. Pages without animation only repaint when their
+// content hash changes, so the faster tick costs them nothing.
+#define DISPLAY_UPDATE_INTERVAL 200
 
 // Button settings
 #define BUTTON_DEBOUNCE_MS 50

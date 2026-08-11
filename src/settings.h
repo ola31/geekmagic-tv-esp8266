@@ -61,5 +61,6 @@ uint8_t powerCycleCounterGet();
 void powerCycleCounterIncrement();
 void powerCycleCounterReset();
 bool powerCycleCounterCheckReset();
+bool powerCycleCounterCheckRecovery();
 
 #endif

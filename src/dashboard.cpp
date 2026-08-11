@@ -161,10 +161,6 @@ void setDataDefaults() {
     dashboardData.weather.high = 24;
     dashboardData.weather.low = 18;
     dashboardData.weather.rainChance = 10;
-
-    dashboardData.focus.durationMinutes = 25;
-    dashboardData.focus.remainingSeconds = 25 * 60;
-    dashboardData.focus.label[0] = '\0';
 }
 
 void normalizeConfig() {
@@ -196,38 +192,8 @@ void normalizeConfig() {
 
 void normalizeData() {
     dashboardData.weather.rainChance = constrain(dashboardData.weather.rainChance, 0, 100);
-
-    for (uint8_t marketIndex = 0; marketIndex < DASHBOARD_MARKET_COUNT; ++marketIndex) {
-        dashboardData.markets[marketIndex].symbol[sizeof(dashboardData.markets[marketIndex].symbol) - 1] = '\0';
-        dashboardData.markets[marketIndex].label[sizeof(dashboardData.markets[marketIndex].label) - 1] = '\0';
-    }
-
-    dashboardData.focus.durationMinutes = constrain(dashboardData.focus.durationMinutes, 1, 240);
-    dashboardData.focus.remainingSeconds = constrain(dashboardData.focus.remainingSeconds, 0UL, 24UL * 3600UL);
-
-    for (uint8_t clockIndex = 0; clockIndex < DASHBOARD_WORLD_CLOCK_COUNT; ++clockIndex) {
-        dashboardData.worldClocks[clockIndex].offsetSeconds =
-            constrain(dashboardData.worldClocks[clockIndex].offsetSeconds, -12L * 3600L, 14L * 3600L);
-        dashboardData.worldClocks[clockIndex].label[sizeof(dashboardData.worldClocks[clockIndex].label) - 1] = '\0';
-    }
-
     dashboardData.weather.location[sizeof(dashboardData.weather.location) - 1] = '\0';
     dashboardData.weather.condition[sizeof(dashboardData.weather.condition) - 1] = '\0';
-    dashboardData.focus.label[sizeof(dashboardData.focus.label) - 1] = '\0';
-    dashboardData.event.title[sizeof(dashboardData.event.title) - 1] = '\0';
-    dashboardData.event.subtitle[sizeof(dashboardData.event.subtitle) - 1] = '\0';
-    dashboardData.quote.text[sizeof(dashboardData.quote.text) - 1] = '\0';
-    dashboardData.quote.author[sizeof(dashboardData.quote.author) - 1] = '\0';
-    dashboardData.status.line1[sizeof(dashboardData.status.line1) - 1] = '\0';
-    dashboardData.status.line2[sizeof(dashboardData.status.line2) - 1] = '\0';
-
-    dashboardData.event.remainingSeconds = constrain(dashboardData.event.remainingSeconds, 0UL, 7UL * 24UL * 3600UL);
-    if (dashboardData.focus.updatedAtEpoch != 0 && dashboardData.focus.updatedAtEpoch < kValidEpochFloor) {
-        dashboardData.focus.updatedAtEpoch = 0;
-    }
-    if (dashboardData.event.updatedAtEpoch != 0 && dashboardData.event.updatedAtEpoch < kValidEpochFloor) {
-        dashboardData.event.updatedAtEpoch = 0;
-    }
 }
 
 bool weatherEquals(const WeatherData &left, const WeatherData &right) {
@@ -237,47 +203,6 @@ bool weatherEquals(const WeatherData &left, const WeatherData &right) {
            left.high == right.high &&
            left.low == right.low &&
            left.rainChance == right.rainChance;
-}
-
-bool marketEquals(const MarketData &left, const MarketData &right) {
-    return left.enabled == right.enabled &&
-           strcmp(left.symbol, right.symbol) == 0 &&
-           strcmp(left.label, right.label) == 0 &&
-           left.price == right.price &&
-           left.change == right.change &&
-           left.changePercent == right.changePercent;
-}
-
-bool focusEquals(const FocusData &left, const FocusData &right) {
-    return strcmp(left.label, right.label) == 0 &&
-           left.running == right.running &&
-           left.breakMode == right.breakMode &&
-           left.durationMinutes == right.durationMinutes &&
-           left.remainingSeconds == right.remainingSeconds &&
-           left.updatedAtEpoch == right.updatedAtEpoch;
-}
-
-bool worldClockEquals(const WorldClockData &left, const WorldClockData &right) {
-    return left.enabled == right.enabled &&
-           strcmp(left.label, right.label) == 0 &&
-           left.offsetSeconds == right.offsetSeconds;
-}
-
-bool eventEquals(const EventData &left, const EventData &right) {
-    return strcmp(left.title, right.title) == 0 &&
-           strcmp(left.subtitle, right.subtitle) == 0 &&
-           left.remainingSeconds == right.remainingSeconds &&
-           left.updatedAtEpoch == right.updatedAtEpoch;
-}
-
-bool quoteEquals(const QuoteData &left, const QuoteData &right) {
-    return strcmp(left.text, right.text) == 0 &&
-           strcmp(left.author, right.author) == 0;
-}
-
-bool statusEquals(const StatusData &left, const StatusData &right) {
-    return strcmp(left.line1, right.line1) == 0 &&
-           strcmp(left.line2, right.line2) == 0;
 }
 
 bool configEquals(const DashboardConfig &left, const DashboardConfig &right) {
@@ -317,27 +242,7 @@ bool configEquals(const DashboardConfig &left, const DashboardConfig &right) {
 }
 
 bool dataEquals(const DashboardData &left, const DashboardData &right) {
-    if (!weatherEquals(left.weather, right.weather) ||
-        !focusEquals(left.focus, right.focus) ||
-        !eventEquals(left.event, right.event) ||
-        !quoteEquals(left.quote, right.quote) ||
-        !statusEquals(left.status, right.status)) {
-        return false;
-    }
-
-    for (uint8_t marketIndex = 0; marketIndex < DASHBOARD_MARKET_COUNT; ++marketIndex) {
-        if (!marketEquals(left.markets[marketIndex], right.markets[marketIndex])) {
-            return false;
-        }
-    }
-
-    for (uint8_t clockIndex = 0; clockIndex < DASHBOARD_WORLD_CLOCK_COUNT; ++clockIndex) {
-        if (!worldClockEquals(left.worldClocks[clockIndex], right.worldClocks[clockIndex])) {
-            return false;
-        }
-    }
-
-    return true;
+    return weatherEquals(left.weather, right.weather);
 }
 
 void captureSavedConfig() {
@@ -384,13 +289,8 @@ void fillConfigJson(JsonObject root) {
     JsonObject pages = root["pages"].to<JsonObject>();
     pages["clock"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_CLOCK];
     pages["weather"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_WEATHER];
-    pages["markets"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_MARKETS];
-    pages["home"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_HOME];
-    pages["focus"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_FOCUS];
-    pages["world"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_WORLD];
-    pages["event"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_EVENT];
-    pages["quote"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_QUOTE];
-    pages["status"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_STATUS];
+    pages["river"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_RIVER];
+    pages["github"] = dashboardConfig.enabledPages[DASHBOARD_PAGE_GITHUB];
 }
 
 void fillDataJson(JsonObject root) {
@@ -401,47 +301,6 @@ void fillDataJson(JsonObject root) {
     weather["high"] = dashboardData.weather.high;
     weather["low"] = dashboardData.weather.low;
     weather["rainChance"] = dashboardData.weather.rainChance;
-
-    JsonArray markets = root["markets"].to<JsonArray>();
-    for (uint8_t marketIndex = 0; marketIndex < DASHBOARD_MARKET_COUNT; ++marketIndex) {
-        JsonObject market = markets.add<JsonObject>();
-        market["enabled"] = dashboardData.markets[marketIndex].enabled;
-        market["symbol"] = dashboardData.markets[marketIndex].symbol;
-        market["label"] = dashboardData.markets[marketIndex].label;
-        market["price"] = dashboardData.markets[marketIndex].price;
-        market["change"] = dashboardData.markets[marketIndex].change;
-        market["changePercent"] = dashboardData.markets[marketIndex].changePercent;
-    }
-
-    JsonObject focus = root["focus"].to<JsonObject>();
-    focus["label"] = dashboardData.focus.label;
-    focus["running"] = dashboardData.focus.running;
-    focus["breakMode"] = dashboardData.focus.breakMode;
-    focus["durationMinutes"] = dashboardData.focus.durationMinutes;
-    focus["remainingSeconds"] = dashboardData.focus.remainingSeconds;
-    focus["updatedAtEpoch"] = dashboardData.focus.updatedAtEpoch;
-
-    JsonArray worldClocks = root["worldClocks"].to<JsonArray>();
-    for (uint8_t clockIndex = 0; clockIndex < DASHBOARD_WORLD_CLOCK_COUNT; ++clockIndex) {
-        JsonObject clock = worldClocks.add<JsonObject>();
-        clock["enabled"] = dashboardData.worldClocks[clockIndex].enabled;
-        clock["label"] = dashboardData.worldClocks[clockIndex].label;
-        clock["offsetSeconds"] = dashboardData.worldClocks[clockIndex].offsetSeconds;
-    }
-
-    JsonObject event = root["event"].to<JsonObject>();
-    event["title"] = dashboardData.event.title;
-    event["subtitle"] = dashboardData.event.subtitle;
-    event["remainingSeconds"] = dashboardData.event.remainingSeconds;
-    event["updatedAtEpoch"] = dashboardData.event.updatedAtEpoch;
-
-    JsonObject quote = root["quote"].to<JsonObject>();
-    quote["text"] = dashboardData.quote.text;
-    quote["author"] = dashboardData.quote.author;
-
-    JsonObject status = root["status"].to<JsonObject>();
-    status["line1"] = dashboardData.status.line1;
-    status["line2"] = dashboardData.status.line2;
 }
 
 void applyPagesObject(JsonObjectConst pages) {
@@ -449,32 +308,21 @@ void applyPagesObject(JsonObjectConst pages) {
         return;
     }
 
-    if (!pages["clock"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_CLOCK] = pages["clock"].as<bool>();
-    }
-    if (!pages["weather"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_WEATHER] = pages["weather"].as<bool>();
-    }
-    if (!pages["markets"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_MARKETS] = pages["markets"].as<bool>();
-    }
-    if (!pages["home"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_HOME] = pages["home"].as<bool>();
-    }
-    if (!pages["focus"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_FOCUS] = pages["focus"].as<bool>();
-    }
-    if (!pages["world"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_WORLD] = pages["world"].as<bool>();
-    }
-    if (!pages["event"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_EVENT] = pages["event"].as<bool>();
-    }
-    if (!pages["quote"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_QUOTE] = pages["quote"].as<bool>();
-    }
-    if (!pages["status"].isNull()) {
-        dashboardConfig.enabledPages[DASHBOARD_PAGE_STATUS] = pages["status"].as<bool>();
+    struct PageKey {
+        const char *name;
+        uint8_t page;
+    };
+    static const PageKey kPageKeys[] = {
+        {"clock", DASHBOARD_PAGE_CLOCK},
+        {"weather", DASHBOARD_PAGE_WEATHER},
+        {"river", DASHBOARD_PAGE_RIVER},
+        {"github", DASHBOARD_PAGE_GITHUB},
+    };
+
+    for (const PageKey &key : kPageKeys) {
+        if (!pages[key.name].isNull()) {
+            dashboardConfig.enabledPages[key.page] = pages[key.name].as<bool>();
+        }
     }
 }
 
@@ -665,169 +513,29 @@ void applyWeatherObject(JsonObjectConst weather) {
     }
 }
 
-void applyMarketsArray(JsonArrayConst markets) {
-    if (markets.isNull()) {
-        return;
-    }
-
-    uint8_t marketIndex = 0;
-    for (JsonObjectConst market : markets) {
-        if (marketIndex >= DASHBOARD_MARKET_COUNT) {
-            break;
-        }
-
-        if (!market["enabled"].isNull()) {
-            dashboardData.markets[marketIndex].enabled = market["enabled"].as<bool>();
-        }
-        if (!market["symbol"].isNull()) {
-            copyString(dashboardData.markets[marketIndex].symbol,
-                       sizeof(dashboardData.markets[marketIndex].symbol),
-                       market["symbol"]);
-        }
-        if (!market["label"].isNull()) {
-            copyString(dashboardData.markets[marketIndex].label,
-                       sizeof(dashboardData.markets[marketIndex].label),
-                       market["label"]);
-        }
-        if (!market["price"].isNull()) {
-            dashboardData.markets[marketIndex].price = market["price"].as<float>();
-        }
-        if (!market["change"].isNull()) {
-            dashboardData.markets[marketIndex].change = market["change"].as<float>();
-        }
-        if (!market["changePercent"].isNull()) {
-            dashboardData.markets[marketIndex].changePercent = market["changePercent"].as<float>();
-        }
-
-        ++marketIndex;
-    }
-}
-
-void applyFocusObject(JsonObjectConst focus) {
-    if (focus.isNull()) {
-        return;
-    }
-
-    bool wasRunning = dashboardData.focus.running;
-    bool runningProvided = !focus["running"].isNull();
-    bool remainingProvided = !focus["remainingSeconds"].isNull();
-    bool updatedAtProvided = !focus["updatedAtEpoch"].isNull();
-
-    if (!focus["label"].isNull()) {
-        copyString(dashboardData.focus.label, sizeof(dashboardData.focus.label), focus["label"]);
-    }
-    if (!focus["breakMode"].isNull()) {
-        dashboardData.focus.breakMode = focus["breakMode"].as<bool>();
-    }
-    if (!focus["durationMinutes"].isNull()) {
-        dashboardData.focus.durationMinutes = focus["durationMinutes"].as<uint16_t>();
-    }
-    if (remainingProvided) {
-        dashboardData.focus.remainingSeconds = focus["remainingSeconds"].as<uint32_t>();
-    }
-    if (updatedAtProvided) {
-        dashboardData.focus.updatedAtEpoch = focus["updatedAtEpoch"].as<uint32_t>();
-    }
-    if (runningProvided) {
-        bool newRunning = focus["running"].as<bool>();
-        if (wasRunning && !newRunning && !remainingProvided) {
-            int32_t pausedRemaining = dashboardFocusRemainingSeconds();
-            dashboardData.focus.remainingSeconds = pausedRemaining > 0 ? static_cast<uint32_t>(pausedRemaining) : 0U;
-        }
-        dashboardData.focus.running = newRunning;
-    }
-
-    uint32_t now = dashboardCurrentEpoch();
-    if (remainingProvided && !updatedAtProvided) {
-        dashboardData.focus.updatedAtEpoch = now;
-    } else if (runningProvided && dashboardData.focus.running && !wasRunning && !updatedAtProvided) {
-        dashboardData.focus.updatedAtEpoch = now;
-    }
-}
-
-void applyWorldClocksArray(JsonArrayConst worldClocks) {
-    if (worldClocks.isNull()) {
-        return;
-    }
-
-    uint8_t clockIndex = 0;
-    for (JsonObjectConst clock : worldClocks) {
-        if (clockIndex >= DASHBOARD_WORLD_CLOCK_COUNT) {
-            break;
-        }
-
-        if (!clock["enabled"].isNull()) {
-            dashboardData.worldClocks[clockIndex].enabled = clock["enabled"].as<bool>();
-        }
-        if (!clock["label"].isNull()) {
-            copyString(dashboardData.worldClocks[clockIndex].label,
-                       sizeof(dashboardData.worldClocks[clockIndex].label),
-                       clock["label"]);
-        }
-        if (!clock["offsetSeconds"].isNull()) {
-            dashboardData.worldClocks[clockIndex].offsetSeconds = clock["offsetSeconds"].as<long>();
-        }
-
-        ++clockIndex;
-    }
-}
-
-void applyEventObject(JsonObjectConst event) {
-    if (event.isNull()) {
-        return;
-    }
-
-    if (!event["title"].isNull()) {
-        copyString(dashboardData.event.title, sizeof(dashboardData.event.title), event["title"]);
-    }
-    if (!event["subtitle"].isNull()) {
-        copyString(dashboardData.event.subtitle, sizeof(dashboardData.event.subtitle), event["subtitle"]);
-    }
-    if (!event["remainingSeconds"].isNull()) {
-        dashboardData.event.remainingSeconds = event["remainingSeconds"].as<uint32_t>();
-        if (event["updatedAtEpoch"].isNull()) {
-            dashboardData.event.updatedAtEpoch = dashboardCurrentEpoch();
-        }
-    }
-    if (!event["updatedAtEpoch"].isNull()) {
-        dashboardData.event.updatedAtEpoch = event["updatedAtEpoch"].as<uint32_t>();
-    }
-}
-
-void applyQuoteObject(JsonObjectConst quote) {
-    if (quote.isNull()) {
-        return;
-    }
-
-    if (!quote["text"].isNull()) {
-        copyString(dashboardData.quote.text, sizeof(dashboardData.quote.text), quote["text"]);
-    }
-    if (!quote["author"].isNull()) {
-        copyString(dashboardData.quote.author, sizeof(dashboardData.quote.author), quote["author"]);
-    }
-}
-
-void applyStatusObject(JsonObjectConst status) {
-    if (status.isNull()) {
-        return;
-    }
-
-    if (!status["line1"].isNull()) {
-        copyString(dashboardData.status.line1, sizeof(dashboardData.status.line1), status["line1"]);
-    }
-    if (!status["line2"].isNull()) {
-        copyString(dashboardData.status.line2, sizeof(dashboardData.status.line2), status["line2"]);
-    }
-}
-
 void applyDataObject(JsonObjectConst root) {
-    applyWeatherObject(root["weather"].as<JsonObjectConst>());
-    applyMarketsArray(root["markets"].as<JsonArrayConst>());
-    applyFocusObject(root["focus"].as<JsonObjectConst>());
-    applyWorldClocksArray(root["worldClocks"].as<JsonArrayConst>());
-    applyEventObject(root["event"].as<JsonObjectConst>());
-    applyQuoteObject(root["quote"].as<JsonObjectConst>());
-    applyStatusObject(root["status"].as<JsonObjectConst>());
+    JsonObjectConst weather = root["weather"].as<JsonObjectConst>();
+    if (!weather.isNull()) {
+        if (!weather["location"].isNull()) {
+            copyString(dashboardData.weather.location, sizeof(dashboardData.weather.location), weather["location"] | "");
+        }
+        if (!weather["condition"].isNull()) {
+            copyString(dashboardData.weather.condition, sizeof(dashboardData.weather.condition), weather["condition"] | "");
+        }
+        if (!weather["temperature"].isNull()) {
+            dashboardData.weather.temperature = weather["temperature"].as<int>();
+        }
+        if (!weather["high"].isNull()) {
+            dashboardData.weather.high = weather["high"].as<int>();
+        }
+        if (!weather["low"].isNull()) {
+            dashboardData.weather.low = weather["low"].as<int>();
+        }
+        if (!weather["rainChance"].isNull()) {
+            dashboardData.weather.rainChance = weather["rainChance"].as<int>();
+        }
+    }
+
     normalizeData();
 }
 
@@ -1014,32 +722,9 @@ void dashboardBuildFullJson(String &json) {
 }
 
 bool dashboardSyncRuntimeState() {
-    uint32_t now = dashboardCurrentEpoch();
-    if (now == 0) {
-        return false;
-    }
-
-    bool changed = false;
-
-    if (dashboardData.focus.running &&
-        dashboardData.focus.remainingSeconds > 0 &&
-        dashboardData.focus.updatedAtEpoch == 0) {
-        dashboardData.focus.updatedAtEpoch = now;
-        changed = true;
-    }
-
-    if (dashboardData.event.remainingSeconds > 0 &&
-        dashboardData.event.updatedAtEpoch == 0) {
-        dashboardData.event.updatedAtEpoch = now;
-        changed = true;
-    }
-
-    if (changed) {
-        normalizeData();
-        dashboardSaveData();
-    }
-
-    return changed;
+    // Nothing on the dashboard counts down any more; the pages read straight
+    // from the feeds, so there is no runtime state to reconcile.
+    return false;
 }
 
 bool dashboardPageEnabled(uint8_t pageId) {
@@ -1073,24 +758,12 @@ uint8_t dashboardNextEnabledPage(uint8_t currentPage) {
 
 const char* dashboardPageName(uint8_t pageId) {
     switch (pageId) {
-        case DASHBOARD_PAGE_CLOCK:
-            return "clock";
         case DASHBOARD_PAGE_WEATHER:
             return "weather";
-        case DASHBOARD_PAGE_MARKETS:
-            return "markets";
-        case DASHBOARD_PAGE_HOME:
-            return "home";
-        case DASHBOARD_PAGE_FOCUS:
-            return "focus";
-        case DASHBOARD_PAGE_WORLD:
-            return "world";
-        case DASHBOARD_PAGE_EVENT:
-            return "event";
-        case DASHBOARD_PAGE_QUOTE:
-            return "quote";
-        case DASHBOARD_PAGE_STATUS:
-            return "status";
+        case DASHBOARD_PAGE_RIVER:
+            return "river";
+        case DASHBOARD_PAGE_GITHUB:
+            return "github";
         default:
             return "clock";
     }
@@ -1138,36 +811,3 @@ int dashboardEffectiveBrightness(int dayBrightness) {
     return constrain(static_cast<int>(dashboardConfig.nightBrightness), 1, 100);
 }
 
-int32_t dashboardFocusRemainingSeconds() {
-    int32_t remainingSeconds = static_cast<int32_t>(dashboardData.focus.remainingSeconds);
-
-    if (!dashboardData.focus.running) {
-        return remainingSeconds;
-    }
-
-    uint32_t now = dashboardCurrentEpoch();
-    if (now == 0 || dashboardData.focus.updatedAtEpoch == 0 || now < dashboardData.focus.updatedAtEpoch) {
-        return remainingSeconds;
-    }
-
-    uint32_t elapsedSeconds = now - dashboardData.focus.updatedAtEpoch;
-    if (elapsedSeconds >= dashboardData.focus.remainingSeconds) {
-        return 0;
-    }
-
-    return static_cast<int32_t>(dashboardData.focus.remainingSeconds - elapsedSeconds);
-}
-
-int32_t dashboardEventRemainingSeconds() {
-    uint32_t now = dashboardCurrentEpoch();
-    if (now == 0 || dashboardData.event.updatedAtEpoch == 0 || now < dashboardData.event.updatedAtEpoch) {
-        return static_cast<int32_t>(dashboardData.event.remainingSeconds);
-    }
-
-    uint32_t elapsedSeconds = now - dashboardData.event.updatedAtEpoch;
-    if (elapsedSeconds >= dashboardData.event.remainingSeconds) {
-        return 0;
-    }
-
-    return static_cast<int32_t>(dashboardData.event.remainingSeconds - elapsedSeconds);
-}

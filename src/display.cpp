@@ -6,15 +6,38 @@
 #include "logger.h"
 #include <ESP8266WiFi.h>
 #include <LittleFS.h>
-#include <TJpg_Decoder.h>
 #include <time.h>
 #include <vector>
+#include "fonts/SansMono11Vlw.h"
+#include "fonts/SansMono13Vlw.h"
+#include "fonts/SansMono16Vlw.h"
+#include "fonts/SansMono18Vlw.h"
+#include "fonts/SansMono22Vlw.h"
+#include "fonts/SansMono26Vlw.h"
+#include "fonts/SansMono44Vlw.h"
+#include "fonts/ClockVlw.h"
+#include "fonts/HeroVlw.h"
 
-#define FONT_INFO 1
-#define FONT_LABEL 2
-#define FONT_BODY 4
-#define FONT_TITLE 6
-#define FONT_HUGE 7
+// Type tiers. Every page text is now drawn with an anti-aliased VLW mono face,
+// the same way the clock and hero temperature already were, so nothing on
+// screen stair-steps. loadMono() maps a pixel size to its VLW array; loadFont
+// auto-unloads the previously loaded face, so switching sizes never leaks heap.
+#define FONT_INFO 13
+#define FONT_LABEL 18
+#define FONT_BODY 26
+#define FONT_TITLE 26
+
+static inline void loadMono(int px) {
+    switch (px) {
+        case 11: tft.loadFont(SansMono11Vlw); break;
+        case 13: tft.loadFont(SansMono13Vlw); break;
+        case 16: tft.loadFont(SansMono16Vlw); break;
+        case 18: tft.loadFont(SansMono18Vlw); break;
+        case 22: tft.loadFont(SansMono22Vlw); break;
+        case 44: tft.loadFont(SansMono44Vlw); break;  // seconds fallback: digits + colon only
+        default: tft.loadFont(SansMono26Vlw); break;
+    }
+}
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite clockDynamicSprite = TFT_eSprite(&tft);
@@ -33,12 +56,18 @@ constexpr int kHeaderTitleY = 10;
 constexpr int kHeaderSubtitleY = 12;
 constexpr int kHeaderRuleY = 32;
 constexpr int kContentTopY = 40;
+// The date sits above the time and the weather line below it, so the repainted
+// region covers only the digits themselves.
 constexpr int kClockDynamicRegionX = 12;
-constexpr int kClockDynamicRegionY = 44;
+// The main time sits a little lower than centre; the region and the time share
+// the same top so the digits never clip against the sprite's bottom edge. The
+// accent rule below the time (in renderClockPage) is moved down by the same
+// amount to keep the spacing under the clock.
+constexpr int kClockDynamicRegionY = 76;
 constexpr int kClockDynamicRegionWidth = DISPLAY_WIDTH - (kClockDynamicRegionX * 2);
-constexpr int kClockDynamicRegionHeight = 64;
-constexpr int kClockTimeY = 54;
-constexpr int kClockMetaY = 118;
+constexpr int kClockDynamicRegionHeight = 86;
+constexpr int kClockTimeY = 76;
+constexpr int kClockMetaY = 38;
 constexpr int kClockFooterY = 148;
 constexpr int kClockFooterHeight = 78;
 constexpr uint32_t kClockSpriteMinFreeHeapBytes = 30000UL;
@@ -79,9 +108,15 @@ struct ThemeSelection {
 
 const ThemePalette kThemes[DASHBOARD_THEME_COUNT] = {
     {
-        rgb565(15, 18, 27),
-        rgb565(29, 35, 47),
-        rgb565(39, 46, 60),
+        // This is an LCD, not the OLED the mock was viewed on: the backlight
+        // leaks through, so the ground already sits at the panel's black floor
+        // and colour cannot take it lower. The cards, though, sit above that
+        // floor and read as visibly grey, so they are pulled well down toward
+        // black - the biggest darkening colour alone can buy without touching
+        // the backlight. Faintly cool, near-neutral, so the light text carries.
+        rgb565(3, 5, 9),      // ground: as close to black as the panel shows
+        rgb565(4, 10, 20),    // main card: dark navy - blue kept dominant so it stays navy, not grey
+        rgb565(10, 18, 36),   // secondary cells: one step up, same dark navy
         rgb565(168, 199, 250),
         rgb565(44, 66, 104),
         rgb565(236, 241, 251),
@@ -142,9 +177,10 @@ RenderCache renderCache = {false, DISPLAY_MODE_DASHBOARD, 0, 0, 0, 0, {0}};
 struct ClockMetaCache {
     bool valid;
     char metaLine[40];
+    char timeText[16];
 };
 
-ClockMetaCache clockMetaCache = {false, {0}};
+ClockMetaCache clockMetaCache = {false, {0}, {0}};
 bool clockDynamicSpriteReady = false;
 bool clockDynamicSpriteAttempted = false;
 bool clockDynamicSpriteAllowed = false;
@@ -325,15 +361,6 @@ void hashThemeConfig(uint32_t &hash) {
     hashCString(hash, selection.text);
 }
 
-bool tftOutput(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t *bitmap) {
-    if (y >= tft.height()) {
-        return false;
-    }
-
-    tft.pushImage(x, y, width, height, bitmap);
-    return true;
-}
-
 const ThemePalette& activeTheme() {
     static ThemePalette customTheme;
     ThemeSelection selection = effectiveThemeSelection();
@@ -356,48 +383,6 @@ String safeCString(const char *value) {
 
 bool hasTimeSync() {
     return dashboardCurrentEpoch() != 0;
-}
-
-String trimTrailingZeros(float value, uint8_t precision = 2) {
-    String result(value, precision);
-    while (result.endsWith("0")) {
-        result.remove(result.length() - 1);
-    }
-    if (result.endsWith(".")) {
-        result.remove(result.length() - 1);
-    }
-    return result;
-}
-
-String groupThousands(const String &value) {
-    int decimalIndex = value.indexOf('.');
-    if (decimalIndex < 0) {
-        decimalIndex = value.length();
-    }
-
-    int startIndex = value.startsWith("-") ? 1 : 0;
-    if (decimalIndex - startIndex <= 3) {
-        return value;
-    }
-
-    String grouped;
-    grouped.reserve(value.length() + ((decimalIndex - startIndex - 1) / 3));
-    if (startIndex == 1) {
-        grouped += '-';
-    }
-
-    for (int index = startIndex; index < static_cast<int>(value.length()); ++index) {
-        grouped += value.charAt(index);
-
-        if (index < decimalIndex - 1) {
-            int remainingDigits = decimalIndex - index - 1;
-            if (remainingDigits > 0 && (remainingDigits % 3) == 0) {
-                grouped += ',';
-            }
-        }
-    }
-
-    return grouped;
 }
 
 String formatTimeForTm(const tm &timeInfo, bool showSeconds, bool use24Hour, bool *isPm = nullptr) {
@@ -436,23 +421,21 @@ String formatLocalDate() {
         return "Waiting for time";
     }
 
+    // "MON 3 AUG" - uppercase, no leading zero, no year, matching the design.
     char buffer[32];
     time_t now = time(nullptr);
     tm localTimeInfo;
     localtime_r(&now, &localTimeInfo);
-    strftime(buffer, sizeof(buffer), "%a %d %b %Y", &localTimeInfo);
-    return String(buffer);
-}
+    strftime(buffer, sizeof(buffer), "%a %b", &localTimeInfo);
 
-String formatWorldTime(long offsetSeconds) {
-    if (!hasTimeSync()) {
-        return "--:--";
-    }
+    String weekday(buffer);
+    int separator = weekday.indexOf(' ');
+    String month = separator >= 0 ? weekday.substring(separator + 1) : String("");
+    weekday = separator >= 0 ? weekday.substring(0, separator) : weekday;
 
-    time_t now = time(nullptr) + offsetSeconds;
-    tm utcTimeInfo;
-    gmtime_r(&now, &utcTimeInfo);
-    return formatTimeForTm(utcTimeInfo, false, dashboardConfig.use24Hour);
+    String result = weekday + " " + String(localTimeInfo.tm_mday) + " " + month;
+    result.toUpperCase();
+    return result;
 }
 
 String formatDuration(int32_t totalSeconds) {
@@ -468,22 +451,6 @@ String formatDuration(int32_t totalSeconds) {
         snprintf(buffer, sizeof(buffer), "%02ld:%02ld", static_cast<long>(minutes), static_cast<long>(seconds));
     }
     return String(buffer);
-}
-
-String formatRelativeCountdown(int32_t totalSeconds) {
-    int32_t boundedSeconds = (totalSeconds > 0) ? totalSeconds : 0;
-    if (boundedSeconds <= 0) {
-        return "Now";
-    }
-
-    int32_t hours = boundedSeconds / 3600;
-    int32_t minutes = (boundedSeconds % 3600) / 60;
-
-    if (hours > 0) {
-        return "in " + String(hours) + "h " + String(minutes) + "m";
-    }
-
-    return "in " + String((minutes > 1) ? minutes : 1) + "m";
 }
 
 String formatUtcOffset(long offsetSeconds) {
@@ -532,35 +499,44 @@ int chooseCanvasFittingFont(TCanvas &canvas,
     return fontCandidates[fontCandidateCount - 1];
 }
 
-template <typename TCanvas>
-void drawClockTime(TCanvas &canvas,
-                   const String &timeText,
+void drawClockTime(const String &timeText,
                    bool showSeconds,
                    uint16_t primaryColor,
-                   uint16_t secondaryColor,
                    uint16_t backgroundColor,
                    int centerX,
                    int topY) {
-    (void)secondaryColor;
-    const int timeFonts[] = {FONT_HUGE, FONT_TITLE, FONT_BODY};
-    int maxWidth = max(0, (centerX * 2) - (showSeconds ? 8 : 20));
-    int timeFont = chooseCanvasFittingFont(canvas,
-                                           timeText,
-                                           maxWidth,
-                                           timeFonts,
-                                           sizeof(timeFonts) / sizeof(timeFonts[0]));
+    // Drawn straight onto the 16-bit panel (not the 4-bit clock sprite) so the
+    // anti-aliased VLW face can blend against the background instead of
+    // stair-stepping. Digits sit either side of a hand-drawn square colon,
+    // bottom-aligned to the baseline, per the design.
+    int centerY = topY + 43;
+    tft.setTextColor(primaryColor, backgroundColor);
 
-    canvas.setTextDatum(TL_DATUM);
-    canvas.setTextFont(FONT_HUGE);
-    int referenceHeight = canvas.fontHeight();
+    int colonIndex = timeText.indexOf(':');
+    if (!showSeconds && colonIndex > 0) {
+        String hours = timeText.substring(0, colonIndex);
+        String minutes = timeText.substring(colonIndex + 1);
+        tft.loadFont(ClockVlw);
+        tft.setTextColor(primaryColor, backgroundColor);
+        tft.setTextDatum(L_BASELINE);
+        int hoursWidth = tft.textWidth(hours);
+        const int colonHalfGap = 15;   // gap from centre to each number's inner edge
+        int baselineY = centerY + 25;  // keeps the digits centred in the region
+        tft.drawString(hours, centerX - colonHalfGap - hoursWidth, baselineY);
+        tft.drawString(minutes, centerX + colonHalfGap, baselineY);
+        tft.unloadFont();
 
-    canvas.setTextColor(primaryColor, backgroundColor);
-    canvas.setTextFont(timeFont);
-    int textWidth = canvas.textWidth(timeText, timeFont);
-    int textHeight = canvas.fontHeight();
-    int adjustedTopY = topY + max(0, (referenceHeight - textHeight) / 2);
-    int startX = centerX - (textWidth / 2);
-    canvas.drawString(timeText, startX, adjustedTopY, timeFont);
+        const int square = 9;
+        const int gap = 9;
+        int colonX = centerX - square / 2;
+        tft.fillRect(colonX, baselineY - square, square, square, primaryColor);              // lower dot, bottom on the baseline
+        tft.fillRect(colonX, baselineY - (2 * square) - gap, square, square, primaryColor);  // upper dot
+        return;
+    }
+
+    loadMono(44);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(timeText, centerX, centerY);
 }
 
 String headerSubtitle() {
@@ -579,72 +555,6 @@ String headerSubtitle() {
     return "";
 }
 
-std::vector<String> wrapText(const String &text, int font, int maxWidth) {
-    std::vector<String> lines;
-
-    if (text.isEmpty()) {
-        lines.push_back("");
-        return lines;
-    }
-
-    tft.setTextFont(font);
-    String currentLine;
-    String currentWord;
-    currentLine.reserve(text.length() + 4);
-    currentWord.reserve(text.length() + 4);
-
-    auto flushWord = [&](bool forceLineBreak) {
-        if (currentWord.isEmpty()) {
-            return;
-        }
-
-        String candidate = currentLine;
-        if (!candidate.isEmpty()) {
-            candidate += " ";
-        }
-        candidate += currentWord;
-
-        if (forceLineBreak || tft.textWidth(candidate) > maxWidth) {
-            if (!currentLine.isEmpty()) {
-                lines.push_back(currentLine);
-                currentLine = currentWord;
-            } else {
-                lines.push_back(currentWord);
-                currentLine = "";
-            }
-        } else {
-            currentLine = candidate;
-        }
-
-        currentWord = "";
-    };
-
-    for (size_t index = 0; index < text.length(); ++index) {
-        char character = text.charAt(index);
-
-        if (character == '\n') {
-            flushWord(false);
-            lines.push_back(currentLine);
-            currentLine = "";
-        } else if (character == ' ') {
-            flushWord(false);
-        } else {
-            currentWord += character;
-        }
-    }
-
-    flushWord(false);
-    if (!currentLine.isEmpty()) {
-        lines.push_back(currentLine);
-    }
-
-    if (lines.empty()) {
-        lines.push_back("");
-    }
-
-    return lines;
-}
-
 void drawRoundedPanel(int x, int y, int width, int height, uint16_t fillColor, uint16_t borderColor) {
     tft.fillRoundRect(x, y, width, height, 18, fillColor);
     tft.drawRoundRect(x, y, width, height, 18, borderColor);
@@ -653,10 +563,12 @@ void drawRoundedPanel(int x, int y, int width, int height, uint16_t fillColor, u
 void drawBadge(int x, int y, int width, int height, const String &label, uint16_t fillColor, uint16_t textColor) {
     tft.fillRoundRect(x, y, width, height, height / 2, fillColor);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(FONT_LABEL);
+    loadMono(13);
     tft.setTextColor(textColor, fillColor);
-    tft.drawString(label, x + (width / 2), y + (height / 2), FONT_LABEL);
+    tft.drawString(label, x + (width / 2), y + (height / 2));
 }
+
+int monoForTier(int tier);
 
 void drawWrappedCenteredText(const String &text,
                              int centerX,
@@ -666,48 +578,61 @@ void drawWrappedCenteredText(const String &text,
                              uint16_t textColor,
                              uint16_t backgroundColor,
                              int lineSpacing = 4) {
-    std::vector<String> lines = wrapText(text, font, maxWidth);
+    loadMono(monoForTier(font));
     tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(font);
     tft.setTextColor(textColor, backgroundColor);
     int lineHeight = tft.fontHeight() + lineSpacing;
 
-    for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
-        tft.drawString(lines[lineIndex], centerX, startY + (lineIndex * lineHeight), font);
-    }
-}
-
-int chooseFittingFont(const String &text, int maxWidth, const int *fontCandidates, size_t fontCandidateCount) {
-    if (fontCandidates == nullptr || fontCandidateCount == 0) {
-        return FONT_INFO;
-    }
-
-    for (size_t index = 0; index < fontCandidateCount; ++index) {
-        int font = fontCandidates[index];
-        if (tft.textWidth(text, font) <= maxWidth) {
-            return font;
+    // Word-wrap against the current mono font, breaking hard on '\n'.
+    std::vector<String> lines;
+    String cur;
+    String word;
+    auto flushWord = [&]() {
+        if (word.length() == 0) {
+            return;
+        }
+        String trial = cur.length() ? cur + " " + word : word;
+        if (static_cast<int>(tft.textWidth(trial)) <= maxWidth || cur.length() == 0) {
+            cur = trial;
+        } else {
+            lines.push_back(cur);
+            cur = word;
+        }
+        word = "";
+    };
+    int length = text.length();
+    for (int index = 0; index <= length; ++index) {
+        char character = (index < length) ? text[index] : ' ';
+        if (character == '\n') {
+            flushWord();
+            lines.push_back(cur);
+            cur = "";
+        } else if (character == ' ') {
+            flushWord();
+        } else {
+            word += character;
         }
     }
+    if (cur.length()) {
+        lines.push_back(cur);
+    }
 
-    return fontCandidates[fontCandidateCount - 1];
+    for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
+        tft.drawString(lines[lineIndex], centerX, startY + (lineIndex * lineHeight));
+    }
 }
 
-void drawAdaptiveBadge(int x,
-                       int y,
-                       int width,
-                       int height,
-                       const String &label,
-                       const int *fontCandidates,
-                       size_t fontCandidateCount,
-                       uint16_t fillColor,
-                       uint16_t textColor) {
-    tft.fillRoundRect(x, y, width, height, height / 2, fillColor);
-    tft.setTextDatum(MC_DATUM);
-
-    int font = chooseFittingFont(label, max(0, width - 12), fontCandidates, fontCandidateCount);
-    tft.setTextFont(font);
-    tft.setTextColor(textColor, fillColor);
-    tft.drawString(label, x + (width / 2), y + (height / 2), font);
+// Maps the old built-in font tiers (FONT_BODY/LABEL/INFO) to the sans-mono
+// faces, so every caller that still asks for a tier gets the monospace face at
+// a matching size.
+int monoForTier(int tier) {
+    if (tier >= FONT_BODY) {
+        return 26;
+    }
+    if (tier >= FONT_LABEL) {
+        return 18;
+    }
+    return 13;
 }
 
 void drawAdaptiveText(const String &text,
@@ -719,11 +644,22 @@ void drawAdaptiveText(const String &text,
                       size_t fontCandidateCount,
                       uint16_t textColor,
                       uint16_t backgroundColor) {
-    int font = chooseFittingFont(text, maxWidth, fontCandidates, fontCandidateCount);
+    // Candidates arrive largest-first; pick the largest mono face that fits.
+    int chosen = monoForTier(fontCandidateCount > 0
+                                 ? fontCandidates[fontCandidateCount - 1]
+                                 : FONT_INFO);
+    for (size_t index = 0; index < fontCandidateCount; ++index) {
+        int candidate = monoForTier(fontCandidates[index]);
+        loadMono(candidate);
+        if (static_cast<int>(tft.textWidth(text)) <= maxWidth) {
+            chosen = candidate;
+            break;
+        }
+    }
+    loadMono(chosen);
     tft.setTextDatum(datum);
-    tft.setTextFont(font);
     tft.setTextColor(textColor, backgroundColor);
-    tft.drawString(text, x, y, font);
+    tft.drawString(text, x, y);
 }
 
 void drawDividerLine(int x, int y, int width, uint16_t color) {
@@ -742,9 +678,9 @@ void drawMetricColumn(int centerX,
                       uint16_t valueColor,
                       uint16_t backgroundColor) {
     tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(FONT_INFO);
+    loadMono(13);
     tft.setTextColor(labelColor, backgroundColor);
-    tft.drawString(label, centerX, topY, FONT_INFO);
+    tft.drawString(label, centerX, topY);
 
     const int valueFonts[] = {FONT_BODY, FONT_LABEL, FONT_INFO};
     drawAdaptiveText(value,
@@ -769,22 +705,22 @@ void drawScreenChrome(const String &title) {
     tft.fillRoundRect(chromeX, chromeY, chromeWidth, chromeHeight, 12, theme.surfaceAlt);
     tft.fillCircle(chromeX + 14, chromeY + (chromeHeight / 2), 4, theme.accent);
     tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(FONT_LABEL);
+    loadMono(18);
     tft.setTextColor(theme.text, theme.surfaceAlt);
-    tft.drawString(title, chromeX + 26, chromeY + 5, FONT_LABEL);
+    tft.drawString(title, chromeX + 26, chromeY + 5);
 
     String subtitle = headerSubtitle();
     if (!subtitle.isEmpty()) {
-        int chipWidth = min(94, tft.textWidth(subtitle, FONT_INFO) + 16);
+        loadMono(13);
+        int chipWidth = min(94, tft.textWidth(subtitle) + 16);
         int chipHeight = 18;
         int chipX = chromeX + chromeWidth - chipWidth - 6;
         int chipY = chromeY + 4;
 
         tft.fillRoundRect(chipX, chipY, chipWidth, chipHeight, chipHeight / 2, theme.background);
         tft.setTextDatum(MC_DATUM);
-        tft.setTextFont(FONT_INFO);
         tft.setTextColor(theme.muted, theme.background);
-        tft.drawString(subtitle, chipX + (chipWidth / 2), chipY + (chipHeight / 2), FONT_INFO);
+        tft.drawString(subtitle, chipX + (chipWidth / 2), chipY + (chipHeight / 2));
     }
 }
 
@@ -796,13 +732,171 @@ void drawPlaceholder(const String &title, const String &message) {
     tft.setTextDatum(TC_DATUM);
     tft.fillRoundRect(98, 68, 44, 44, 22, theme.accentSoft);
     tft.setTextColor(theme.accent, theme.accentSoft);
-    tft.setTextFont(FONT_TITLE);
-    tft.drawString("?", 120, 78, FONT_TITLE);
+    loadMono(26);
+    tft.drawString("?", 120, 78);
 
     tft.setTextColor(theme.text, theme.surface);
-    tft.setTextFont(FONT_BODY);
-    tft.drawString("Nothing here yet", 120, 128, FONT_BODY);
+    loadMono(18);
+    tft.drawString("Nothing here yet", 120, 128);
     drawWrappedCenteredText(message, 120, 154, 184, FONT_INFO, theme.muted, theme.surface, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Shared page furniture
+//
+// The rotating pages use one spacing scale so they read as a single design:
+// a 16 px margin on every side, a 26 px title (the largest letters these
+// bitmap fonts carry), a short accent rule under it, and cards that never sit
+// closer than 16 px to each other.
+// ---------------------------------------------------------------------------
+constexpr int kCardMargin = 16;
+constexpr int kHeadingTextY = 12;
+constexpr int kAccentRuleY = 50;
+constexpr int kAccentRuleWidth = 46;
+
+uint16_t rgbToColor(uint8_t red, uint8_t green, uint8_t blue) {
+    return static_cast<uint16_t>(((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3));
+}
+
+// Each page carries its own accent so a rotation step is felt, not just read.
+uint16_t pageAccentColor(uint8_t pageId) {
+    switch (pageId) {
+        case DASHBOARD_PAGE_RIVER:
+            return rgbToColor(0x35, 0xC8, 0xE8);
+        case DASHBOARD_PAGE_GITHUB:
+            return rgbToColor(0x58, 0xA6, 0xFF);
+        case DASHBOARD_PAGE_WEATHER:
+            return rgbToColor(0xFF, 0xB4, 0x54);
+        default:
+            return activeTheme().accent;
+    }
+}
+
+// These fonts stop at ASCII 126, so there is no degree glyph to print. Drawing
+// the ring keeps the unit legible and lets it match the page accent.
+void drawDegreeRing(int x, int y, int radius, uint16_t color, uint16_t background) {
+    // At small radii a two-pixel wall closes the ring up, so the hole scales.
+    tft.fillCircle(x, y, radius, color);
+    tft.fillCircle(x, y, radius <= 3 ? radius - 1 : radius - 2, background);
+}
+
+void drawThickLine(int x0, int y0, int x1, int y1, int thickness, uint16_t color) {
+    int half = thickness / 2;
+    for (int offset = -half; offset <= half; ++offset) {
+        tft.drawLine(x0 + offset, y0, x1 + offset, y1, color);
+        tft.drawLine(x0, y0 + offset, x1, y1 + offset, color);
+    }
+}
+
+// The hero reading uses its own larger anti-aliased VLW face, drawn from the
+// vertical centre so the group sits in the middle of its card.
+void drawHeroReading(const String &value,
+                     char unit,
+                     int centerX,
+                     int centerY,
+                     uint16_t textColor,
+                     uint16_t accentColor,
+                     uint16_t background) {
+    // The reading itself is centred on the screen; the degree sign and unit hang
+    // off its right edge. Centring the pair instead would push the number left
+    // of centre, which is what the design avoids.
+    // The big reading uses the anti-aliased VLW face (like the clock) so it
+    // does not stair-step; it is drawn once per page render, never animated.
+    tft.loadFont(HeroVlw);
+    tft.setTextColor(textColor, background);
+    int valueWidth = tft.textWidth(value);
+    int startX = centerX - (valueWidth / 2);
+
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString(value, startX, centerY);
+    tft.unloadFont();
+
+    int unitX = startX + valueWidth + 6;
+    drawDegreeRing(unitX + 6, centerY - 14, 5, accentColor, background);
+    loadMono(18);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(accentColor, background);
+    tft.drawString(String(unit), unitX + 14, centerY + 4);
+}
+
+// Small readings print the degree as a drawn ring, matching the design; the
+// bitmap fonts have no such glyph.
+void drawSmallDegreeValue(const String &value, int centerX, int y, uint16_t color, uint16_t accentColor, uint16_t background) {
+    loadMono(18);
+    int valueWidth = tft.textWidth(value);
+    int startX = centerX - ((valueWidth + 9) / 2);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(color, background);
+    tft.drawString(value, startX, y);
+    drawDegreeRing(startX + valueWidth + 4, y + 4, 3, accentColor, background);
+}
+
+void drawAccentRule(int x, uint16_t color) {
+    tft.fillRect(x, kAccentRuleY, kAccentRuleWidth, 2, color);
+}
+
+void drawSunGlyph(int cx, int cy, int radius, uint16_t color) {
+    tft.fillCircle(cx, cy, radius, color);
+    for (int index = 0; index < 8; ++index) {
+        float angle = index * PI / 4.0f;
+        drawThickLine(cx + static_cast<int>(lroundf(cosf(angle) * (radius + 4))),
+                      cy + static_cast<int>(lroundf(sinf(angle) * (radius + 4))),
+                      cx + static_cast<int>(lroundf(cosf(angle) * (radius + 8))),
+                      cy + static_cast<int>(lroundf(sinf(angle) * (radius + 8))),
+                      2,
+                      color);
+    }
+}
+
+void drawCloudGlyph(int cx, int cy, uint16_t color) {
+    tft.fillCircle(cx - 7, cy + 2, 6, color);
+    tft.fillCircle(cx + 1, cy - 3, 8, color);
+    tft.fillCircle(cx + 9, cy + 2, 6, color);
+    tft.fillRect(cx - 7, cy + 2, 17, 6, color);
+}
+
+// Picks a glyph from the Open-Meteo condition wording rather than the raw code,
+// so it keeps working whatever phrasing the feed returns.
+void drawWeatherMark(const char *condition, int cx, int cy, uint16_t color) {
+    String text(condition);
+    text.toLowerCase();
+
+    if (text.indexOf("thunder") >= 0 || text.indexOf("storm") >= 0) {
+        drawCloudGlyph(cx, cy - 3, color);
+        tft.fillTriangle(cx - 3, cy + 8, cx + 4, cy + 8, cx, cy + 16, rgbToColor(0xFF, 0xE0, 0x6A));
+        return;
+    }
+
+    if (text.indexOf("snow") >= 0) {
+        drawCloudGlyph(cx, cy - 3, color);
+        for (int index = -1; index <= 1; ++index) {
+            tft.fillCircle(cx + (index * 7), cy + 12, 2, color);
+        }
+        return;
+    }
+
+    if (text.indexOf("rain") >= 0 || text.indexOf("drizzle") >= 0 || text.indexOf("shower") >= 0) {
+        drawCloudGlyph(cx, cy - 3, color);
+        for (int index = -1; index <= 1; ++index) {
+            drawThickLine(cx + (index * 7), cy + 9, cx + (index * 7) - 2, cy + 15, 2, color);
+        }
+        return;
+    }
+
+    if (text.indexOf("fog") >= 0) {
+        for (int index = 0; index < 3; ++index) {
+            drawThickLine(cx - 11, cy - 4 + (index * 6), cx + 11, cy - 4 + (index * 6), 2, color);
+        }
+        return;
+    }
+
+    if (text.indexOf("cloud") >= 0 || text.indexOf("overcast") >= 0) {
+        drawCloudGlyph(cx, cy, color);
+        return;
+    }
+
+    drawSunGlyph(cx, cy, 7, color);
 }
 
 const WeatherData* effectiveWeatherData() {
@@ -823,184 +917,12 @@ String formatWeatherTemperature(int value) {
     return String(value) + weatherUnitSymbol();
 }
 
-const MarketData* effectiveMarketData(uint8_t index) {
-    if (index >= DASHBOARD_MARKET_COUNT) {
-        return nullptr;
-    }
-
-    uint8_t source = feedsMarketSource(index);
-    return (source == MARKET_FEED_FINNHUB || source == MARKET_FEED_COINGECKO)
-               ? feedsMarketData(index)
-               : nullptr;
-}
-
-String marketCurrencyPrefix(uint8_t index) {
-    if (index >= DASHBOARD_MARKET_COUNT) {
-        return "$";
-    }
-
-    String currency = safeCString(feedConfig.markets[index].currency);
-    currency.trim();
-    currency.toLowerCase();
-    if (currency.length() == 0) {
-        currency = "usd";
-    }
-
-    if (currency == "usd") {
-        return "$";
-    }
-    if (currency == "cad") {
-        return "CA$";
-    }
-    if (currency == "aud") {
-        return "AU$";
-    }
-    if (currency == "nzd") {
-        return "NZ$";
-    }
-    if (currency == "sgd") {
-        return "SG$";
-    }
-    if (currency == "hkd") {
-        return "HK$";
-    }
-
-    currency.toUpperCase();
-    return currency + " ";
-}
-
-String formatMarketPriceValue(float price) {
-    float absolutePrice = price >= 0.0f ? price : -price;
-    uint8_t precision = 2;
-
-    if (absolutePrice >= 1000.0f) {
-        precision = 0;
-    } else if (absolutePrice >= 100.0f) {
-        precision = 1;
-    } else if (absolutePrice >= 1.0f) {
-        precision = 2;
-    } else if (absolutePrice >= 0.1f) {
-        precision = 3;
-    } else {
-        precision = 4;
-    }
-
-    return groupThousands(trimTrailingZeros(price, precision));
-}
-
-String formatMarketPrice(uint8_t index, float price) {
-    return marketCurrencyPrefix(index) + formatMarketPriceValue(price);
-}
-
-String marketChangeWindowLabel(uint8_t index) {
-    return feedsMarketSource(index) == MARKET_FEED_COINGECKO ? "24h" : "1d";
-}
-
-String formatMarketChangeSummary(uint8_t index, float changePercent) {
-    float absoluteChange = changePercent >= 0.0f ? changePercent : -changePercent;
-    uint8_t precision = absoluteChange >= 10.0f ? 1 : 2;
-    return marketChangeWindowLabel(index) +
-           " " +
-           (changePercent >= 0.0f ? "+" : "") +
-           trimTrailingZeros(changePercent, precision) +
-           "%";
-}
-
-bool marketWaitingForSync(uint8_t index) {
-    uint8_t source = feedsMarketSource(index);
-    return (source == MARKET_FEED_FINNHUB || source == MARKET_FEED_COINGECKO) &&
-           feedsMarketConfigured(index) &&
-           !feedsHasMarketData(index);
-}
-
-bool anyMarketsWaitingForSync() {
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        if (marketWaitingForSync(index)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-String homeAssistantSlotLabel(uint8_t index) {
-    if (index >= HOME_ASSISTANT_SLOT_COUNT) {
-        return "Entity";
-    }
-
-    const HomeAssistantSlotConfig &slot = feedConfig.homeAssistant.slots[index];
-    if (slot.label[0] != '\0') {
-        return safeCString(slot.label);
-    }
-
-    const HomeAssistantSlotData *runtimeSlot = feedsHomeAssistantSlotData(index);
-    if (runtimeSlot != nullptr && runtimeSlot->label[0] != '\0') {
-        return runtimeSlot->label;
-    }
-
-    String entityId = safeCString(slot.entityId);
-    int separatorIndex = entityId.lastIndexOf('.');
-    if (separatorIndex >= 0 && separatorIndex < static_cast<int>(entityId.length()) - 1) {
-        entityId = entityId.substring(separatorIndex + 1);
-    }
-    entityId.replace("_", " ");
-    if (entityId.length() == 0) {
-        return "Entity";
-    }
-
-    bool capitalizeNext = true;
-    for (size_t charIndex = 0; charIndex < entityId.length(); ++charIndex) {
-        char character = entityId.charAt(charIndex);
-        if (capitalizeNext && character >= 'a' && character <= 'z') {
-            entityId.setCharAt(charIndex, static_cast<char>(toupper(character)));
-            capitalizeNext = false;
-        } else if (character == ' ') {
-            capitalizeNext = true;
-        } else {
-            capitalizeNext = false;
-        }
-    }
-
-    return entityId;
-}
-
-String homeAssistantSlotUnit(uint8_t index) {
-    if (index >= HOME_ASSISTANT_SLOT_COUNT) {
-        return "";
-    }
-
-    const HomeAssistantSlotConfig &slot = feedConfig.homeAssistant.slots[index];
-    if (slot.unit[0] != '\0') {
-        return safeCString(slot.unit);
-    }
-
-    const HomeAssistantSlotData *runtimeSlot = feedsHomeAssistantSlotData(index);
-    return runtimeSlot != nullptr ? safeCString(runtimeSlot->unit) : String("");
-}
-
-bool homeAssistantSlotConfigured(uint8_t index) {
-    return index < HOME_ASSISTANT_SLOT_COUNT &&
-           feedConfig.homeAssistant.slots[index].enabled &&
-           feedConfig.homeAssistant.slots[index].entityId[0] != '\0';
-}
-
-bool homeAssistantWaitingForSync() {
-    return feedsHomeAssistantConfigured() && !feedsHasHomeAssistantData();
-}
-
 bool hasWeatherContent() {
     const WeatherData *weather = effectiveWeatherData();
     return weather != nullptr &&
            (weather->location[0] != '\0' ||
             weather->condition[0] != '\0' ||
             feedsHasWeatherData());
-}
-
-bool hasFocusContent() {
-    return dashboardData.focus.running ||
-           dashboardData.focus.breakMode ||
-           dashboardData.focus.label[0] != '\0' ||
-           dashboardData.focus.remainingSeconds != static_cast<uint32_t>(dashboardData.focus.durationMinutes) * 60UL;
 }
 
 const char* activeClockMessage() {
@@ -1014,54 +936,23 @@ const char* activeClockMessage() {
 
     return displayState.line2;
 }
+String formatEventAge(uint32_t createdAt);
 
-bool hasMarketContent() {
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        const MarketData *market = effectiveMarketData(index);
-        if (market != nullptr &&
-            market->symbol[0] != '\0' &&
-            market->enabled) {
-            return true;
-        }
-    }
 
-    return false;
+bool hasRiverContent() {
+    return feedsHasRiverData();
 }
 
-bool hasHomeAssistantContent() {
-    if (!feedsHomeAssistantConfigured()) {
-        return false;
-    }
-
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        if (homeAssistantSlotConfigured(index)) {
-            return true;
-        }
-    }
-
-    return false;
+bool riverWaitingForSync() {
+    return feedsRiverConfigured() && !feedsHasRiverData();
 }
 
-bool hasWorldClockContent() {
-    for (uint8_t index = 0; index < DASHBOARD_WORLD_CLOCK_COUNT; ++index) {
-        if (dashboardData.worldClocks[index].enabled && dashboardData.worldClocks[index].label[0] != '\0') {
-            return true;
-        }
-    }
-
-    return false;
+bool hasGithubContent() {
+    return feedsHasGithubData();
 }
 
-bool hasEventContent() {
-    return dashboardData.event.title[0] != '\0' || dashboardData.event.subtitle[0] != '\0' || dashboardData.event.remainingSeconds > 0;
-}
-
-bool hasQuoteContent() {
-    return dashboardData.quote.text[0] != '\0';
-}
-
-bool hasStatusContent() {
-    return dashboardData.status.line1[0] != '\0' || dashboardData.status.line2[0] != '\0';
+bool githubWaitingForSync() {
+    return feedsGithubConfigured() && !feedsHasGithubData();
 }
 
 bool dashboardPageHasRenderableContent(uint8_t pageId) {
@@ -1070,20 +961,10 @@ bool dashboardPageHasRenderableContent(uint8_t pageId) {
             return true;
         case DASHBOARD_PAGE_WEATHER:
             return hasWeatherContent() || weatherWaitingForSync();
-        case DASHBOARD_PAGE_MARKETS:
-            return hasMarketContent() || anyMarketsWaitingForSync();
-        case DASHBOARD_PAGE_HOME:
-            return hasHomeAssistantContent() || homeAssistantWaitingForSync();
-        case DASHBOARD_PAGE_FOCUS:
-            return hasFocusContent();
-        case DASHBOARD_PAGE_WORLD:
-            return hasWorldClockContent();
-        case DASHBOARD_PAGE_EVENT:
-            return hasEventContent();
-        case DASHBOARD_PAGE_QUOTE:
-            return hasQuoteContent();
-        case DASHBOARD_PAGE_STATUS:
-            return hasStatusContent();
+        case DASHBOARD_PAGE_RIVER:
+            return hasRiverContent() || riverWaitingForSync();
+        case DASHBOARD_PAGE_GITHUB:
+            return hasGithubContent() || githubWaitingForSync();
         default:
             return false;
     }
@@ -1138,65 +1019,6 @@ void hashWeatherData(uint32_t &hash) {
     hashValue(hash, weather->rainChance);
 }
 
-void hashMarketData(uint32_t &hash) {
-    for (uint8_t index = 0; index < DASHBOARD_MARKET_COUNT; ++index) {
-        hashValue(hash, feedsMarketSource(index));
-        hashValue(hash, marketWaitingForSync(index));
-        hashCString(hash, feedConfig.markets[index].currency);
-
-        const MarketData *market = effectiveMarketData(index);
-        bool hasData = market != nullptr;
-        hashValue(hash, hasData);
-        if (!hasData) {
-            continue;
-        }
-
-        hashValue(hash, market->enabled);
-        hashCString(hash, market->symbol);
-        hashCString(hash, market->label);
-        hashValue(hash, market->price);
-        hashValue(hash, market->change);
-        hashValue(hash, market->changePercent);
-    }
-}
-
-void hashHomeAssistantData(uint32_t &hash) {
-    hashValue(hash, feedsHomeAssistantConfigured());
-    hashValue(hash, feedsHasHomeAssistantData());
-    hashValue(hash, homeAssistantWaitingForSync());
-    hashCString(hash, feedConfig.homeAssistant.baseUrl);
-    hashValue(hash, feedConfig.homeAssistant.refreshMinutes);
-
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        const HomeAssistantSlotConfig &slotConfig = feedConfig.homeAssistant.slots[index];
-        hashValue(hash, slotConfig.enabled);
-        hashCString(hash, slotConfig.entityId);
-        hashCString(hash, slotConfig.label);
-        hashCString(hash, slotConfig.unit);
-
-        const HomeAssistantSlotData *slot = feedsHomeAssistantSlotData(index);
-        bool hasData = slot != nullptr;
-        hashValue(hash, hasData);
-        if (!hasData) {
-            continue;
-        }
-
-        hashValue(hash, slot->numeric);
-        hashCString(hash, slot->label);
-        hashCString(hash, slot->state);
-        hashCString(hash, slot->unit);
-    }
-}
-
-void hashWorldClockData(uint32_t &hash) {
-    for (uint8_t index = 0; index < DASHBOARD_WORLD_CLOCK_COUNT; ++index) {
-        const WorldClockData &clock = dashboardData.worldClocks[index];
-        hashValue(hash, clock.enabled);
-        hashCString(hash, clock.label);
-        hashValue(hash, clock.offsetSeconds);
-    }
-}
-
 void hashCommonPageState(uint32_t &hash, uint8_t pageId) {
     hashValue(hash, pageId);
     hashThemeConfig(hash);
@@ -1224,34 +1046,36 @@ uint32_t dashboardStaticHash(uint8_t pageId) {
         case DASHBOARD_PAGE_WEATHER:
             hashWeatherData(hash);
             break;
-        case DASHBOARD_PAGE_MARKETS:
-            hashMarketData(hash);
+        case DASHBOARD_PAGE_RIVER: {
+            const RiverData *river = feedsRiverData();
+            hashValue(hash, river != nullptr);
+            if (river != nullptr) {
+                hashCString(hash, river->station);
+                hashCString(hash, river->observedAt);
+                hashValue(hash, river->temperature);
+            }
+            // The page also shows the air temperature next to the water value.
+            hashWeatherData(hash);
             break;
-        case DASHBOARD_PAGE_HOME:
-            hashHomeAssistantData(hash);
+        }
+        case DASHBOARD_PAGE_GITHUB: {
+            const GithubData *github = feedsGithubData();
+            hashValue(hash, github != nullptr);
+            if (github != nullptr) {
+                hashValue(hash, github->cursor);
+                const GithubEventEntry &event = github->events[github->cursor % github->count];
+                hashCString(hash, event.kind);
+                hashCString(hash, event.repo);
+                hashCString(hash, event.actor);
+                hashCString(hash, event.detail);
+                // The relative age ("3 min ago") is deliberately not hashed: it
+                // ticks every minute, and hashing it forced a full-screen
+                // repaint each time, which read as a flicker. It is drawn once
+                // when the page is shown (accurate then) and refreshed on the
+                // next visit, when the cursor advances anyway.
+            }
             break;
-        case DASHBOARD_PAGE_FOCUS:
-            hashCString(hash, dashboardData.focus.label);
-            hashValue(hash, dashboardData.focus.running);
-            hashValue(hash, dashboardData.focus.breakMode);
-            hashValue(hash, dashboardData.focus.durationMinutes);
-            break;
-        case DASHBOARD_PAGE_WORLD:
-            hashValue(hash, dashboardConfig.use24Hour);
-            hashWorldClockData(hash);
-            break;
-        case DASHBOARD_PAGE_EVENT:
-            hashCString(hash, dashboardData.event.title);
-            hashCString(hash, dashboardData.event.subtitle);
-            break;
-        case DASHBOARD_PAGE_QUOTE:
-            hashCString(hash, dashboardData.quote.text);
-            hashCString(hash, dashboardData.quote.author);
-            break;
-        case DASHBOARD_PAGE_STATUS:
-            hashCString(hash, dashboardData.status.line1);
-            hashCString(hash, dashboardData.status.line2);
-            break;
+        }
         default:
             break;
     }
@@ -1273,26 +1097,10 @@ uint32_t dashboardDynamicHash(uint8_t pageId) {
             hashValue(hash, isPm);
             break;
         }
-        case DASHBOARD_PAGE_FOCUS: {
-            int32_t remainingSeconds = dashboardFocusRemainingSeconds();
-            hashValue(hash, remainingSeconds);
-            break;
-        }
-        case DASHBOARD_PAGE_WORLD: {
-            for (uint8_t index = 0; index < DASHBOARD_WORLD_CLOCK_COUNT; ++index) {
-                const WorldClockData &clock = dashboardData.worldClocks[index];
-                if (!clock.enabled || clock.label[0] == '\0') {
-                    continue;
-                }
-
-                String timeText = formatWorldTime(clock.offsetSeconds);
-                hashCString(hash, timeText.c_str());
-            }
-            break;
-        }
-        case DASHBOARD_PAGE_EVENT: {
-            String countdown = formatRelativeCountdown(dashboardEventRemainingSeconds());
-            hashCString(hash, countdown.c_str());
+        case DASHBOARD_PAGE_RIVER: {
+            // Mirrors riverWavePhase(); folding it into the hash is what drives
+            // the water animation through the existing partial-redraw path.
+            hashValue(hash, static_cast<uint8_t>((millis() / 200UL) % 32UL));
             break;
         }
         default:
@@ -1325,9 +1133,7 @@ uint32_t temporaryMessageHash() {
 
 bool pageUsesDynamicRefresh(uint8_t pageId) {
     return pageId == DASHBOARD_PAGE_CLOCK ||
-           pageId == DASHBOARD_PAGE_FOCUS ||
-           pageId == DASHBOARD_PAGE_WORLD ||
-           pageId == DASHBOARD_PAGE_EVENT;
+           pageId == DASHBOARD_PAGE_RIVER;
 }
 
 bool ensureClockDynamicSprite() {
@@ -1372,38 +1178,31 @@ void updateClockDynamicArea() {
     bool isPm = false;
     String timeText = formatLocalTime(dashboardConfig.showSeconds, dashboardConfig.use24Hour, &isPm);
     String metaLine = formatClockMetaLine(isPm);
-    uint16_t dynamicBackground = theme.surface;
-    int localTimeTopY = kClockTimeY - kClockDynamicRegionY;
+    // The clock page no longer sits on a panel, so the repaint colour is the
+    // page background rather than the card surface.
+    uint16_t dynamicBackground = theme.background;
 
-    if (ensureClockDynamicSprite()) {
-        clockDynamicSprite.fillSprite(dynamicBackground);
-        drawClockTime(clockDynamicSprite,
-                      timeText,
-                      dashboardConfig.showSeconds,
-                      theme.text,
-                      theme.muted,
-                      dynamicBackground,
-                      kClockDynamicRegionWidth / 2,
-                      localTimeTopY);
-        clockDynamicSprite.pushSprite(kClockDynamicRegionX, kClockDynamicRegionY);
-    } else {
+    // Redraw the time only when it changes (once a minute for HH:MM) so drawing
+    // straight onto the panel does not flash. renderClockPage() clears the cache
+    // to force a full repaint on page entry.
+    if (!clockMetaCache.valid || strcmp(clockMetaCache.timeText, timeText.c_str()) != 0) {
         tft.fillRect(kClockDynamicRegionX,
                      kClockDynamicRegionY,
                      kClockDynamicRegionWidth,
                      kClockDynamicRegionHeight,
                      dynamicBackground);
-        drawClockTime(tft,
-                      timeText,
+        drawClockTime(timeText,
                       dashboardConfig.showSeconds,
                       theme.text,
-                      theme.muted,
                       dynamicBackground,
                       120,
                       kClockTimeY);
+        strncpy(clockMetaCache.timeText, timeText.c_str(), sizeof(clockMetaCache.timeText) - 1);
+        clockMetaCache.timeText[sizeof(clockMetaCache.timeText) - 1] = '\0';
     }
 
     if (!clockMetaCache.valid || strcmp(clockMetaCache.metaLine, metaLine.c_str()) != 0) {
-        tft.setTextFont(FONT_BODY);
+        loadMono(18);
         int metaWidth = tft.textWidth(metaLine) + 12;
         if (clockMetaCache.valid) {
             metaWidth = max(metaWidth, tft.textWidth(clockMetaCache.metaLine) + 12);
@@ -1412,137 +1211,51 @@ void updateClockDynamicArea() {
         tft.setTextDatum(TC_DATUM);
         tft.setTextColor(theme.muted, dynamicBackground);
         tft.setTextPadding(metaWidth);
-        tft.drawString(metaLine, 120, kClockMetaY, FONT_BODY);
+        tft.drawString(metaLine, 120, kClockMetaY);
         tft.setTextPadding(0);
         updateClockMetaCache(metaLine);
     }
 }
 
-void updateFocusDynamicArea() {
-    const ThemePalette &theme = activeTheme();
-    int32_t remainingSeconds = dashboardFocusRemainingSeconds();
-
-    tft.fillRect(20, 92, 200, 112, theme.surface);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(FONT_HUGE);
-    tft.setTextColor(theme.text, theme.surface);
-    tft.drawString(formatDuration(remainingSeconds), 120, 106, FONT_HUGE);
-
-    int progressWidth = 184;
-    int progressHeight = 8;
-    int progressX = 28;
-    int progressY = 178;
-    tft.fillRoundRect(progressX, progressY, progressWidth, progressHeight, 4, theme.surfaceAlt);
-    if (dashboardData.focus.durationMinutes > 0) {
-        uint32_t totalSeconds = static_cast<uint32_t>(dashboardData.focus.durationMinutes) * 60UL;
-        uint32_t boundedRemaining = remainingSeconds > 0 ? static_cast<uint32_t>(remainingSeconds) : 0U;
-        uint32_t elapsedSeconds = (boundedRemaining < totalSeconds) ? (totalSeconds - boundedRemaining) : totalSeconds;
-        uint32_t safeTotal = totalSeconds > 0 ? totalSeconds : 1U;
-        int filledWidth = map(elapsedSeconds, 0, safeTotal, 0, progressWidth);
-        filledWidth = constrain(filledWidth, 0, progressWidth);
-        if (filledWidth > 0) {
-            tft.fillRoundRect(progressX, progressY, filledWidth, progressHeight, 4, theme.accent);
-        }
-    }
-
-    tft.setTextFont(FONT_INFO);
-    tft.setTextColor(theme.muted, theme.surface);
-    tft.drawString("Duration " + String(dashboardData.focus.durationMinutes) + " min", 120, 196, FONT_INFO);
-}
-
-void updateWorldDynamicArea() {
-    const ThemePalette &theme = activeTheme();
-    int y = 70;
-    for (uint8_t clockIndex = 0; clockIndex < DASHBOARD_WORLD_CLOCK_COUNT; ++clockIndex) {
-        const WorldClockData &clock = dashboardData.worldClocks[clockIndex];
-        if (!clock.enabled || clock.label[0] == '\0') {
-            continue;
-        }
-
-        tft.fillRect(20, y, 118, 26, theme.surface);
-        tft.setTextDatum(TL_DATUM);
-        tft.setTextFont(FONT_TITLE);
-        tft.setTextColor(theme.text, theme.surface);
-        tft.drawString(formatWorldTime(clock.offsetSeconds), 20, y, FONT_TITLE);
-        y += 72;
-    }
-}
-
-void updateEventDynamicArea() {
-    const ThemePalette &theme = activeTheme();
-    tft.fillRect(20, 96, 200, 52, theme.surface);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(FONT_HUGE);
-    tft.setTextColor(theme.accent, theme.surface);
-    tft.drawString(formatRelativeCountdown(dashboardEventRemainingSeconds()), 120, 100, FONT_HUGE);
-}
-
 void renderClockPage() {
     const ThemePalette &theme = activeTheme();
-    const int compactFonts[] = {FONT_BODY, FONT_LABEL, FONT_INFO};
-    const int footerConditionFonts[] = {FONT_LABEL, FONT_INFO};
-    const int footerTemperatureFonts[] = {FONT_BODY, FONT_LABEL, FONT_INFO};
-    drawScreenChrome("Clock");
-    drawRoundedPanel(8, 40, 224, 106, theme.surface, theme.surfaceAlt);
+    tft.fillScreen(theme.background);
     clockMetaCache.valid = false;
     updateClockDynamicArea();
 
+    tft.fillRect(97, 166, kAccentRuleWidth, 2, rgbToColor(0x6E, 0xE7, 0xC0));
+
     const char *clockMessage = activeClockMessage();
-    bool showBottomPanel = hasWeatherContent() || weatherWaitingForSync() || clockMessage != nullptr;
-    if (!showBottomPanel) {
-        return;
-    }
-
-    drawRoundedPanel(8, 154, 224, 66, theme.surfaceAlt, theme.surfaceAlt);
     if (hasWeatherContent()) {
+        // Laid out as one centred group: weather glyph, reading, degree, unit.
         const WeatherData *weather = effectiveWeatherData();
-        int footerLeft = 18;
-        tft.setTextDatum(TL_DATUM);
-        tft.setTextFont(FONT_INFO);
-        tft.setTextColor(theme.muted, theme.surfaceAlt);
-        String location = (weather != nullptr && weather->location[0] != '\0') ? weather->location : "Weather";
-        tft.drawString(location, footerLeft, 166, FONT_INFO);
+        const uint16_t weatherAccent = pageAccentColor(DASHBOARD_PAGE_WEATHER);
+        const int rowCenterY = 196;
 
-        drawAdaptiveBadge(158,
-                          160,
-                          62,
-                          24,
-                          formatWeatherTemperature(weather->temperature),
-                          footerTemperatureFonts,
-                          sizeof(footerTemperatureFonts) / sizeof(footerTemperatureFonts[0]),
-                          theme.accentSoft,
-                          theme.accent);
+        String valueText = String(weather->temperature);
+        loadMono(18);
+        int valueWidth = tft.textWidth(valueText);
+        int unitWidth = 10 + tft.textWidth(String(weatherUnitSymbol()));
+        int groupWidth = 30 + valueWidth + unitWidth;
+        int groupX = 120 - (groupWidth / 2);
 
-        tft.setTextColor(theme.text, theme.surfaceAlt);
-        String condition = weather->condition[0] != '\0' ? weather->condition : "Ready";
-        drawAdaptiveText(condition,
-                         footerLeft,
-                         188,
-                         132,
-                         TL_DATUM,
-                         footerConditionFonts,
-                         sizeof(footerConditionFonts) / sizeof(footerConditionFonts[0]),
-                         theme.text,
-                         theme.surfaceAlt);
+        // The design marks the weather here with a plain dot; the descriptive
+        // glyph belongs on the weather page.
+        tft.fillCircle(groupX + 8, rowCenterY, 7, weatherAccent);
 
-        tft.setTextFont(FONT_INFO);
-        tft.setTextColor(theme.muted, theme.surfaceAlt);
-        String summary = "H " + formatWeatherTemperature(weather->high) +
-                         "  L " + formatWeatherTemperature(weather->low) +
-                         "  Rain " + String(weather->rainChance) + "%";
-        drawAdaptiveText(summary,
-                         footerLeft,
-                         202,
-                         188,
-                         TL_DATUM,
-                         compactFonts,
-                         sizeof(compactFonts) / sizeof(compactFonts[0]),
-                         theme.muted,
-                         theme.surfaceAlt);
+        tft.setTextDatum(ML_DATUM);
+        tft.setTextColor(theme.text, theme.background);
+        tft.drawString(valueText, groupX + 30, rowCenterY);
+
+        int unitX = groupX + 30 + valueWidth;
+        drawDegreeRing(unitX + 5, rowCenterY - 5, 4, weatherAccent, theme.background);
+        tft.setTextColor(weatherAccent, theme.background);
+        tft.drawString(String(weatherUnitSymbol()), unitX + 12, rowCenterY);
+
     } else if (weatherWaitingForSync()) {
-        drawWrappedCenteredText("Syncing weather...", 120, 182, 192, FONT_INFO, theme.muted, theme.surfaceAlt, 2);
+        drawWrappedCenteredText("Syncing weather...", 120, 184, 192, FONT_LABEL, theme.muted, theme.background, 2);
     } else if (clockMessage != nullptr) {
-        drawWrappedCenteredText(clockMessage, 120, 178, 192, FONT_LABEL, theme.text, theme.surfaceAlt, 2);
+        drawWrappedCenteredText(clockMessage, 120, 180, 192, FONT_LABEL, theme.text, theme.background, 2);
     }
 }
 
@@ -1558,428 +1271,556 @@ void renderWeatherPage() {
     }
 
     const WeatherData *weather = effectiveWeatherData();
-    const int heroFonts[] = {FONT_HUGE, FONT_TITLE, FONT_BODY};
-    const int compactFonts[] = {FONT_BODY, FONT_LABEL, FONT_INFO};
-    drawScreenChrome("Weather");
-    drawRoundedPanel(8, 36, 224, 110, theme.surface, theme.surfaceAlt);
+    const uint16_t accent = pageAccentColor(DASHBOARD_PAGE_WEATHER);
+
+    tft.fillScreen(theme.background);
+
+    drawWeatherMark(weather->condition, 30, 26, accent);
+    tft.setTextDatum(TL_DATUM);
+    loadMono(26);
+    tft.setTextColor(theme.text, theme.background);
+    tft.drawString(weather->location[0] != '\0' ? weather->location : "WEATHER",
+                   kCardMargin + 40,
+                   kHeadingTextY);
+    drawAccentRule(kCardMargin + 2, accent);
+
+    tft.fillRoundRect(kCardMargin, 66, 240 - (kCardMargin * 2), 94, 14, theme.surface);
+
+    drawHeroReading(String(weather->temperature), weatherUnitSymbol(), 120, 104, theme.text, accent, theme.surface);
+
+    // The design sets the condition in caps, e.g. CLEAR SKY.
+    String conditionText(weather->condition[0] != '\0' ? weather->condition : "Updated");
+    conditionText.toUpperCase();
+
+    const int conditionFonts[] = {FONT_LABEL, FONT_INFO};
+    drawAdaptiveText(conditionText,
+                     120,
+                     134,
+                     190,
+                     TC_DATUM,
+                     conditionFonts,
+                     sizeof(conditionFonts) / sizeof(conditionFonts[0]),
+                     theme.muted,
+                     theme.surface);
+
+    struct WeatherCell {
+        const char *label;
+        String value;
+        bool showsDegree;
+    };
+    const WeatherCell cells[] = {
+        {"HIGH", String(weather->high), true},
+        {"LOW", String(weather->low), true},
+        {"RAIN", String(weather->rainChance) + "%", false},
+    };
+
+    const int cellWidth = 66;
+    const int cellGap = 5;
+    for (int index = 0; index < 3; ++index) {
+        int cellX = kCardMargin + (index * (cellWidth + cellGap));
+        tft.fillRoundRect(cellX, 176, cellWidth, 48, 10, theme.surfaceAlt);
+
+        tft.setTextDatum(TC_DATUM);
+        loadMono(13);
+        tft.setTextColor(theme.muted, theme.surfaceAlt);
+        tft.drawString(cells[index].label, cellX + (cellWidth / 2), 186);
+
+        if (cells[index].showsDegree) {
+            drawSmallDegreeValue(cells[index].value, cellX + (cellWidth / 2), 202, theme.text, accent, theme.surfaceAlt);
+        } else {
+            tft.setTextDatum(TC_DATUM);
+            loadMono(18);
+            tft.setTextColor(theme.text, theme.surfaceAlt);
+            tft.drawString(cells[index].value, cellX + (cellWidth / 2), 202);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Han River page
+// ---------------------------------------------------------------------------
+constexpr int kRiverCardX = kCardMargin;
+constexpr int kRiverCardY = 68;
+constexpr int kRiverCardW = 240 - (kCardMargin * 2);
+constexpr int kRiverCardH = 118;
+constexpr int kRiverCardRadius = 16;
+// The water band starts below the label. Anything drawn inside this band is
+// repainted every second by the animation, so static text must stay above it.
+constexpr int kRiverWaterTop = 136;
+constexpr int kRiverLabelY = 164;   // caption baseline area, sitting on the water
+
+// One full wave cycle per 32 ticks at 5 Hz, so the surface drifts across in
+// about six seconds. The step count has to divide the cycle exactly or the
+// water jumps when the counter wraps.
+constexpr uint8_t kRiverWavePhaseSteps = 32;
+
+uint8_t riverWavePhase() {
+    return static_cast<uint8_t>((millis() / 200UL) % kRiverWavePhaseSteps);
+}
+
+// The water is tinted by the reading itself: icy blue through winter, cyan and
+// teal in the shoulder seasons, amber once the river is genuinely warm. The
+// page can then be read at a glance, before the number registers.
+void riverWaterColors(float celsius, uint16_t &deep, uint16_t &crest, uint16_t &accent) {
+    struct TemperatureBand {
+        float below;
+        uint8_t red;
+        uint8_t green;
+        uint8_t blue;
+    };
+
+    // Two ramps. The water stays inside the blue-to-teal family, because a
+    // warm hue dimmed for the surface turns muddy brown and stops reading as
+    // water at all. The accent carries the full cold-to-hot range instead.
+    // Blue always stays ahead of green: the moment green leads, the surface
+    // reads as mint rather than water. Temperature only slides the balance.
+    static const TemperatureBand kWaterBands[] = {
+        {5.0f, 0x18, 0x34, 0xB4},
+        {10.0f, 0x1A, 0x42, 0xAC},
+        {15.0f, 0x1C, 0x4E, 0xA4},
+        {20.0f, 0x1E, 0x5A, 0xA0},
+        {24.0f, 0x20, 0x64, 0x9E},
+        {27.0f, 0x22, 0x6C, 0x9E},
+        {999.0f, 0x24, 0x74, 0xA0},
+    };
+
+    static const TemperatureBand kAccentBands[] = {
+        {5.0f, 0x6E, 0xB4, 0xFF},
+        {10.0f, 0x4F, 0xC4, 0xF0},
+        {15.0f, 0x35, 0xC8, 0xE8},
+        {20.0f, 0x46, 0xD6, 0xB4},
+        {24.0f, 0x9A, 0xD8, 0x60},
+        {27.0f, 0xE8, 0xC0, 0x4A},
+        {999.0f, 0xFF, 0x9A, 0x50},
+    };
+
+    auto pick = [celsius](const TemperatureBand *bands, size_t count) {
+        for (size_t index = 0; index < count; ++index) {
+            if (celsius < bands[index].below) {
+                return &bands[index];
+            }
+        }
+        return &bands[count - 1];
+    };
+
+    const TemperatureBand *water = pick(kWaterBands, sizeof(kWaterBands) / sizeof(kWaterBands[0]));
+    const TemperatureBand *tint = pick(kAccentBands, sizeof(kAccentBands) / sizeof(kAccentBands[0]));
+
+    auto scale = [](uint8_t channel, float factor) {
+        return static_cast<uint8_t>(lroundf(channel * factor));
+    };
+
+    accent = rgbToColor(tint->red, tint->green, tint->blue);
+    crest = rgbToColor(scale(water->red, 0.46f), scale(water->green, 0.46f), scale(water->blue, 0.46f));
+    deep = rgbToColor(scale(water->red, 0.26f), scale(water->green, 0.26f), scale(water->blue, 0.26f));
+}
+
+// Repaints only the water band. The temperature above it is left untouched, so
+// the animation costs one strip of vertical lines and never flickers the value.
+void drawRiverWater(uint8_t phase) {
+    const ThemePalette &theme = activeTheme();
+    const RiverData *river = feedsRiverData();
+    uint16_t deep = 0;
+    uint16_t crest = 0;
+    uint16_t accent = 0;
+    riverWaterColors(river != nullptr ? river->temperature : 15.0f, deep, crest, accent);
+
+    const int left = kRiverCardX + 2;
+    const int right = kRiverCardX + kRiverCardW - 2;
+    const int bottom = kRiverCardY + kRiverCardH - 2;
+    const int cornerRadius = kRiverCardRadius - 2;
+
+    // The caption sits on the water, as designed. Its box is skipped during the
+    // repaint so the animation never erases and redraws it - that flicker was
+    // the whole reason it had been moved off the water before.
+    loadMono(16);
+    int labelWidth = tft.textWidth("WATER TEMP");
+    // Match the caption box exactly (fillRect at 120-w/2-7, width w+14, so its
+    // last column is 120+w/2+6). Keeping these in step stops the water either
+    // showing the card through a seam or clipping the caption's edge letters.
+    const int labelLeft = 120 - (labelWidth / 2) - 7;
+    const int labelRight = 120 + (labelWidth / 2) + 6;
+    const int labelTop = kRiverLabelY - 1;
+    const int labelBottom = kRiverLabelY + 17;
+
+    // Draws a vertical run, skipping the caption box where they overlap.
+    auto fillColumn = [&](int x, int top, int columnBottom, uint16_t color) {
+        if (top > columnBottom) {
+            return;
+        }
+        if (x < labelLeft || x > labelRight) {
+            tft.drawFastVLine(x, top, columnBottom - top + 1, color);
+            return;
+        }
+        if (top < labelTop) {
+            tft.drawFastVLine(x, top, min(labelTop, columnBottom + 1) - top, color);
+        }
+        if (columnBottom > labelBottom) {
+            int start = max(top, labelBottom + 1);
+            tft.drawFastVLine(x, start, columnBottom - start + 1, color);
+        }
+    };
+
+
+    for (int x = left; x < right; ++x) {
+        // Follow the card's rounded bottom so the water never spills outside it.
+        int edgeDistance = min(x - left, right - 1 - x);
+        int columnBottom = bottom;
+        if (edgeDistance < cornerRadius) {
+            int dx = cornerRadius - edgeDistance;
+            int lift = cornerRadius -
+                       static_cast<int>(lroundf(sqrtf(static_cast<float>(
+                           (cornerRadius * cornerRadius) - (dx * dx)))));
+            columnBottom = bottom - lift;
+        }
+
+        // Both layers advance by the same phase each frame so they wrap cleanly
+        // together; only their wavelengths differ, which is what gives the
+        // surface its depth.
+        float travel = static_cast<float>(phase) * (2.0f * PI / kRiverWavePhaseSteps);
+        float column = static_cast<float>(x - left);
+        int backTop = kRiverWaterTop + 4 + static_cast<int>(lroundf(sinf((column / 34.0f) + travel + 1.9f) * 3.0f));
+        int frontTop = kRiverWaterTop + 11 + static_cast<int>(lroundf(sinf((column / 24.0f) + travel) * 4.0f));
+
+        fillColumn(x, kRiverWaterTop, columnBottom, theme.surface);
+        fillColumn(x, backTop, columnBottom, deep);
+        fillColumn(x, frontTop, columnBottom, crest);
+    }
+}
+
+void updateRiverDynamicArea() {
+    if (!hasRiverContent()) {
+        return;
+    }
+
+    drawRiverWater(riverWavePhase());
+}
+
+void renderRiverPage() {
+    const ThemePalette &theme = activeTheme();
+    if (!hasRiverContent()) {
+        if (riverWaitingForSync()) {
+            drawPlaceholder("Han River", "Syncing water temp.");
+            return;
+        }
+        drawPlaceholder("Han River", "Enable the river feed.");
+        return;
+    }
+
+    const RiverData *river = feedsRiverData();
+
+    // The whole page takes its accent from the reading, so the dot, the degree
+    // sign and the water all shift together as the river warms or cools.
+    uint16_t waterDeep = 0;
+    uint16_t waterCrest = 0;
+    uint16_t accent = 0;
+    riverWaterColors(river->temperature, waterDeep, waterCrest, accent);
+
+    tft.fillScreen(theme.background);
 
     tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(FONT_INFO);
-    tft.setTextColor(theme.muted, theme.surface);
-    tft.drawString(weather->location[0] != '\0' ? weather->location : "Weather",
-                   120, 50, FONT_INFO);
+    loadMono(26);
+    tft.setTextColor(theme.text, theme.background);
+    tft.drawString("HAN RIVER", 120, kHeadingTextY);
 
-    drawAdaptiveText(formatWeatherTemperature(weather->temperature),
-                     120,
-                     74,
-                     180,
+    // Station and observation hour share one line, separated by a drawn dot
+    // because the fonts have no middle-dot glyph.
+    String station = river->station[0] != '\0' ? String(river->station) : String("HAN RIVER");
+    String observed = river->observedAt[0] != '\0' ? String(river->observedAt) : String("--");
+    loadMono(13);
+    int stationWidth = tft.textWidth(station);
+    int observedWidth = tft.textWidth(observed);
+    int subtitleX = 120 - ((stationWidth + 16 + observedWidth) / 2);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(theme.muted, theme.background);
+    tft.drawString(station, subtitleX, 42);
+    tft.fillCircle(subtitleX + stationWidth + 8, 48, 2, accent);
+    tft.drawString(observed, subtitleX + stationWidth + 16, 42);
+
+    tft.fillRoundRect(kRiverCardX, kRiverCardY, kRiverCardW, kRiverCardH, kRiverCardRadius, theme.surface);
+
+    drawHeroReading(String(river->temperature, 1), 'C', 120, 106, theme.text, accent, theme.surface);
+
+    drawRiverWater(riverWavePhase());
+
+    // The caption sits inside the water band, but the animation skips its box
+    // entirely, so it is painted once here. Repainting it every frame is what
+    // made it flicker.
+    loadMono(16);
+    int captionWidth = tft.textWidth("WATER TEMP");
+    tft.fillRect(120 - (captionWidth / 2) - 7,
+                 kRiverLabelY - 1,
+                 captionWidth + 14,
+                 19,
+                 waterCrest);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(rgbToColor(0xD5, 0xF0, 0xF7), waterCrest);
+    tft.drawString("WATER TEMP", 120, kRiverLabelY);
+
+    // The comparison with the air temperature is the point of the page, so the
+    // difference is spelled out rather than left for the reader to subtract.
+    const WeatherData *weather = effectiveWeatherData();
+    bool haveAir = weather != nullptr && feedsHasWeatherData();
+
+    tft.setTextDatum(TL_DATUM);
+    loadMono(13);
+    tft.setTextColor(theme.muted, theme.background);
+    tft.drawString("AIR", kCardMargin + 20, 200);
+
+    if (haveAir) {
+        float delta = river->temperature - static_cast<float>(weather->temperature);
+        bool cooler = delta < 0.0f;
+        uint16_t deltaColor = cooler ? accent : theme.warning;
+        int arrowX = kCardMargin + 2;
+
+        if (cooler) {
+            tft.fillTriangle(arrowX, 200, arrowX + 12, 200, arrowX + 6, 210, deltaColor);
+        } else {
+            tft.fillTriangle(arrowX, 210, arrowX + 12, 210, arrowX + 6, 200, deltaColor);
+        }
+
+        // Air reading and the difference read as one phrase on the right, as
+        // designed, rather than being pushed to opposite edges.
+        String deltaText = String(" / ") + (delta > 0 ? String("+") : String("")) + String(delta, 1);
+        String airText = String(weather->temperature);
+
+        loadMono(18);
+        int airWidth = tft.textWidth(airText);
+        int deltaWidth = tft.textWidth(deltaText);
+        int groupX = 240 - kCardMargin - airWidth - 11 - deltaWidth;
+
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(theme.text, theme.background);
+        tft.drawString(airText, groupX, 194);
+        drawDegreeRing(groupX + airWidth + 5, 200, 4, accent, theme.background);
+        tft.setTextColor(deltaColor, theme.background);
+        tft.drawString(deltaText, groupX + airWidth + 11, 194);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GitHub page
+// ---------------------------------------------------------------------------
+void drawStarIcon(int cx, int cy, int radius, uint16_t color) {
+    int16_t pointX[10];
+    int16_t pointY[10];
+    for (int index = 0; index < 10; ++index) {
+        float pointRadius = (index % 2 == 0) ? static_cast<float>(radius) : radius * 0.44f;
+        float angle = -PI / 2.0f + (index * PI / 5.0f);
+        pointX[index] = cx + static_cast<int16_t>(lroundf(cosf(angle) * pointRadius));
+        pointY[index] = cy + static_cast<int16_t>(lroundf(sinf(angle) * pointRadius));
+    }
+
+    for (int index = 0; index < 10; ++index) {
+        int next = (index + 1) % 10;
+        tft.fillTriangle(cx, cy, pointX[index], pointY[index], pointX[next], pointY[next], color);
+    }
+}
+
+void drawForkIcon(int cx, int cy, uint16_t color) {
+    drawThickLine(cx - 6, cy - 12, cx - 6, cy + 2, 3, color);
+    drawThickLine(cx - 6, cy + 2, cx + 6, cy + 6, 3, color);
+    tft.fillCircle(cx - 6, cy - 14, 4, color);
+    tft.fillCircle(cx - 6, cy + 12, 4, color);
+    tft.fillCircle(cx + 8, cy + 8, 4, color);
+}
+
+void drawPullRequestIcon(int cx, int cy, uint16_t color) {
+    drawThickLine(cx - 7, cy - 10, cx - 7, cy + 8, 3, color);
+    drawThickLine(cx + 7, cy - 8, cx + 7, cy + 6, 3, color);
+    tft.fillCircle(cx - 7, cy - 13, 4, color);
+    tft.fillCircle(cx + 7, cy + 10, 4, color);
+    tft.fillCircle(cx + 7, cy - 12, 4, color);
+}
+
+void drawIssueIcon(int cx, int cy, uint16_t color) {
+    tft.fillCircle(cx, cy, 13, color);
+    tft.fillCircle(cx, cy, 9, activeTheme().surface);
+    tft.fillCircle(cx, cy, 4, color);
+}
+
+void drawCommentIcon(int cx, int cy, uint16_t color) {
+    tft.fillRoundRect(cx - 15, cy - 11, 30, 20, 5, color);
+    tft.fillTriangle(cx - 6, cy + 8, cx + 2, cy + 8, cx - 8, cy + 16, color);
+}
+
+void drawPushIcon(int cx, int cy, uint16_t color) {
+    drawThickLine(cx, cy - 2, cx, cy + 13, 4, color);
+    tft.fillTriangle(cx - 10, cy - 2, cx + 10, cy - 2, cx, cy - 14, color);
+}
+
+void drawReviewIcon(int cx, int cy, uint16_t color) {
+    tft.fillCircle(cx, cy, 13, color);
+    tft.fillCircle(cx, cy, 10, activeTheme().surface);
+    drawThickLine(cx - 6, cy, cx - 2, cy + 5, 3, color);
+    drawThickLine(cx - 2, cy + 5, cx + 6, cy - 5, 3, color);
+}
+
+void drawReleaseIcon(int cx, int cy, uint16_t color) {
+    tft.fillRect(cx - 12, cy - 2, 24, 14, color);
+    tft.fillRect(cx - 8, cy + 1, 16, 8, activeTheme().surface);
+    tft.fillTriangle(cx - 14, cy - 2, cx + 14, cy - 2, cx, cy - 15, color);
+}
+
+void drawGithubEventIcon(const char *kind, int cx, int cy) {
+    if (strcmp(kind, "STAR") == 0) {
+        drawStarIcon(cx, cy, 19, rgbToColor(0xF2, 0xC7, 0x44));
+    } else if (strcmp(kind, "FORK") == 0) {
+        drawForkIcon(cx, cy, rgbToColor(0x58, 0xA6, 0xFF));
+    } else if (strcmp(kind, "PULL REQ") == 0) {
+        drawPullRequestIcon(cx, cy, rgbToColor(0xA4, 0xF0, 0xB8));
+    } else if (strcmp(kind, "ISSUE") == 0) {
+        drawIssueIcon(cx, cy, rgbToColor(0xA4, 0xF0, 0xB8));
+    } else if (strcmp(kind, "COMMENT") == 0) {
+        drawCommentIcon(cx, cy, rgbToColor(0x9C, 0x8C, 0xF0));
+    } else if (strcmp(kind, "REVIEW") == 0) {
+        drawReviewIcon(cx, cy, rgbToColor(0xF2, 0xA3, 0x5A));
+    } else if (strcmp(kind, "RELEASE") == 0) {
+        drawReleaseIcon(cx, cy, rgbToColor(0xC0, 0xCA, 0xD3));
+    } else {
+        drawPushIcon(cx, cy, rgbToColor(0x7D, 0xE3, 0xF0));
+    }
+}
+
+// The three dots and two strokes of a branch, used as the page mark.
+void drawBranchMark(int x, int y, uint16_t color) {
+    drawThickLine(x, y + 3, x, y + 17, 3, color);
+    drawThickLine(x, y + 14, x + 12, y + 18, 3, color);
+    tft.fillCircle(x, y, 4, color);
+    tft.fillCircle(x, y + 20, 4, color);
+    tft.fillCircle(x + 14, y + 18, 4, color);
+}
+
+// GitHub publishes its event feed a few minutes late, so the age is shown as a
+// real figure rather than a vague "just now" that would overstate freshness.
+String formatEventAge(uint32_t createdAt) {
+    if (createdAt == 0 || !hasTimeSync()) {
+        return String("recently");
+    }
+
+    uint32_t now = static_cast<uint32_t>(time(nullptr));
+    if (now <= createdAt) {
+        return String("just now");
+    }
+
+    uint32_t seconds = now - createdAt;
+    if (seconds < 90) {
+        return String("just now");
+    }
+    if (seconds < 3600) {
+        return String(static_cast<int>(seconds / 60)) + " min ago";
+    }
+    if (seconds < 86400) {
+        int hours = static_cast<int>(seconds / 3600);
+        return String(hours) + (hours == 1 ? " hour ago" : " hours ago");
+    }
+
+    int days = static_cast<int>(seconds / 86400);
+    return String(days) + (days == 1 ? " day ago" : " days ago");
+}
+
+
+void renderGithubPage() {
+    const ThemePalette &theme = activeTheme();
+    if (!hasGithubContent()) {
+        if (githubWaitingForSync()) {
+            drawPlaceholder("GitHub", "Syncing live events.");
+            return;
+        }
+        drawPlaceholder("GitHub", "Enable the GitHub feed.");
+        return;
+    }
+
+    const GithubData *github = feedsGithubData();
+    const GithubEventEntry &event = github->events[github->cursor % github->count];
+    const uint16_t accent = pageAccentColor(DASHBOARD_PAGE_GITHUB);
+
+    // "owner/name" does not fit on one line, and the name is the part worth
+    // reading, so the owner is demoted to a small line above it.
+    String repo(event.repo);
+    String owner;
+    String name = repo;
+    int slashIndex = repo.indexOf('/');
+    if (slashIndex > 0) {
+        owner = repo.substring(0, slashIndex);
+        name = repo.substring(slashIndex + 1);
+    }
+
+    tft.fillScreen(theme.background);
+
+    drawBranchMark(kCardMargin + 6, 14, accent);
+    tft.setTextDatum(TL_DATUM);
+    loadMono(26);
+    tft.setTextColor(theme.text, theme.background);
+    tft.drawString("GITHUB", kCardMargin + 36, kHeadingTextY);
+    drawAccentRule(kCardMargin + 2, accent);
+
+    tft.fillRoundRect(kCardMargin, 66, 240 - (kCardMargin * 2), 76, 14, theme.surface);
+    drawGithubEventIcon(event.kind[0] != '\0' ? event.kind : "EVENT", 56, 104);
+
+    const int kindFonts[] = {FONT_BODY, FONT_LABEL, FONT_INFO};
+    bool hasDetail = event.detail[0] != '\0';
+    drawAdaptiveText(event.kind[0] != '\0' ? event.kind : "EVENT",
+                     152,
+                     hasDetail ? 76 : 84,
+                     130,
                      TC_DATUM,
-                     heroFonts,
-                     sizeof(heroFonts) / sizeof(heroFonts[0]),
+                     kindFonts,
+                     sizeof(kindFonts) / sizeof(kindFonts[0]),
                      theme.text,
                      theme.surface);
 
-    drawAdaptiveText(weather->condition[0] != '\0' ? weather->condition : "Updated",
-                     120,
-                     118,
-                     180,
+    const int detailFonts[] = {FONT_INFO};
+    if (hasDetail) {
+        drawAdaptiveText(event.detail,
+                         152,
+                         104,
+                         138,
+                         TC_DATUM,
+                         detailFonts,
+                         sizeof(detailFonts) / sizeof(detailFonts[0]),
+                         accent,
+                         theme.surface);
+    }
+
+    drawAdaptiveText(formatEventAge(event.createdAt),
+                     152,
+                     hasDetail ? 122 : 116,
+                     138,
                      TC_DATUM,
-                     compactFonts,
-                     sizeof(compactFonts) / sizeof(compactFonts[0]),
-                     theme.accent,
+                     detailFonts,
+                     sizeof(detailFonts) / sizeof(detailFonts[0]),
+                     theme.muted,
                      theme.surface);
 
-    drawRoundedPanel(8, 156, 224, 64, theme.surfaceAlt, theme.surfaceAlt);
-    drawDividerColumn(82, 168, 40, theme.background);
-    drawDividerColumn(156, 168, 40, theme.background);
-    drawMetricColumn(45, 170, "High", formatWeatherTemperature(weather->high), theme.muted, theme.text, theme.surfaceAlt);
-    drawMetricColumn(119, 170, "Low", formatWeatherTemperature(weather->low), theme.muted, theme.text, theme.surfaceAlt);
-    drawMetricColumn(193, 170, "Rain", String(weather->rainChance) + "%", theme.muted, theme.text, theme.surfaceAlt);
-}
+    tft.setTextDatum(TL_DATUM);
+    loadMono(13);
+    tft.setTextColor(theme.muted, theme.background);
+    tft.drawString(owner.length() > 0 ? owner + " /" : String("github /"), kCardMargin + 4, 154);
 
-void renderMarketsPage() {
-    const ThemePalette &theme = activeTheme();
-    if (!hasMarketContent()) {
-        if (anyMarketsWaitingForSync()) {
-            drawPlaceholder("Markets", "Syncing live data.");
-            return;
-        }
-        drawPlaceholder("Markets", "Add ticker data.");
-        return;
+    // Repo name is the part worth reading: 22 px, dropping to 18 only when a
+    // long name would overrun the card.
+    loadMono(22);
+    if (static_cast<int>(tft.textWidth(name)) > 240 - (kCardMargin * 2) - 8) {
+        loadMono(18);
     }
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(theme.text, theme.background);
+    tft.drawString(name, kCardMargin + 4, 174);
 
-    drawScreenChrome("Markets");
-    drawRoundedPanel(8, 36, 224, 184, theme.surface, theme.surfaceAlt);
-
-    int y = 50;
-    bool firstRow = true;
-    const int standardPriceFonts[] = {FONT_TITLE, FONT_BODY, FONT_LABEL};
-    const int compactPriceFonts[] = {FONT_BODY, FONT_LABEL, FONT_INFO};
-    const int symbolFonts[] = {FONT_BODY, FONT_LABEL};
-    const int labelFonts[] = {FONT_BODY, FONT_LABEL, FONT_INFO};
-    const int deltaFonts[] = {FONT_INFO};
-    for (uint8_t marketIndex = 0; marketIndex < DASHBOARD_MARKET_COUNT; ++marketIndex) {
-        const MarketData *market = effectiveMarketData(marketIndex);
-        if (market == nullptr ||
-            market->symbol[0] == '\0' ||
-            !market->enabled) {
-            continue;
-        }
-
-        if (!firstRow) {
-            drawDividerLine(20, y - 8, 192, theme.surfaceAlt);
-        }
-
-        tft.setTextDatum(TL_DATUM);
-        String marketLabel = market->label[0] != '\0' ? market->label : "Live feed";
-        drawAdaptiveText(market->symbol,
-                         20,
-                         y,
-                         72,
-                         TL_DATUM,
-                         symbolFonts,
-                         sizeof(symbolFonts) / sizeof(symbolFonts[0]),
-                         theme.accent,
-                         theme.surface);
-        drawAdaptiveText(marketLabel,
-                         20,
-                         y + 20,
-                         104,
-                         TL_DATUM,
-                         labelFonts,
-                         sizeof(labelFonts) / sizeof(labelFonts[0]),
-                         theme.text,
-                         theme.surface);
-
-        tft.setTextDatum(TR_DATUM);
-        String priceText = formatMarketPrice(marketIndex, market->price);
-        const int *priceFonts = standardPriceFonts;
-        size_t priceFontCount = sizeof(standardPriceFonts) / sizeof(standardPriceFonts[0]);
-        if (priceText.length() >= 8 || tft.textWidth(priceText, FONT_TITLE) > 126) {
-            priceFonts = compactPriceFonts;
-            priceFontCount = sizeof(compactPriceFonts) / sizeof(compactPriceFonts[0]);
-        }
-
-        int priceFont = chooseFittingFont(priceText, 134, priceFonts, priceFontCount);
-        tft.setTextFont(priceFont);
-        tft.setTextColor(theme.text, theme.surface);
-        tft.drawString(priceText, 220, y + 2, priceFont);
-
-        int deltaY = y + 2 + tft.fontHeight() + 4;
-
-        uint16_t deltaColor = market->changePercent >= 0.0f ? theme.positive : theme.negative;
-        drawAdaptiveText(formatMarketChangeSummary(marketIndex, market->changePercent),
-                         220,
-                         deltaY,
-                         134,
-                         TR_DATUM,
-                         deltaFonts,
-                         sizeof(deltaFonts) / sizeof(deltaFonts[0]),
-                         deltaColor,
-                         theme.surface);
-
-        y += 58;
-        firstRow = false;
-    }
-}
-
-void drawHomeAssistantCard(int x,
-                           int y,
-                           int width,
-                           int height,
-                           uint8_t slotIndex,
-                           uint16_t fillColor,
-                           uint16_t borderColor) {
-    const ThemePalette &theme = activeTheme();
-    drawRoundedPanel(x, y, width, height, fillColor, borderColor);
-
-    tft.fillRoundRect(x + 10, y + 10, 26, 4, 2, theme.accentSoft);
-
-    const int labelFonts[] = {FONT_LABEL, FONT_INFO};
-    const int valueFonts[] = {FONT_TITLE, FONT_BODY, FONT_LABEL, FONT_INFO};
-    const int unitFonts[] = {FONT_INFO};
-    const HomeAssistantSlotData *slot = feedsHomeAssistantSlotData(slotIndex);
-    int labelY = y + 18;
-    int stateY = height >= 120 ? y + 74 : (height >= 96 ? y + 50 : y + 40);
-    int unitY = height >= 120 ? y + 106 : (height >= 96 ? y + 76 : y + 61);
-
-    String label = homeAssistantSlotLabel(slotIndex);
-    drawAdaptiveText(label,
-                     x + 12,
-                     labelY,
-                     width - 24,
+    // The account name is the human part of the event, so it gets the same
+    // weight as the repository rather than being tucked away at label size.
+    const int actorFonts[] = {FONT_LABEL, FONT_INFO};
+    drawAdaptiveText(event.actor[0] != '\0' ? String(event.actor) : String("someone"),
+                     kCardMargin + 4,
+                     206,
+                     240 - (kCardMargin * 2) - 8,
                      TL_DATUM,
-                     labelFonts,
-                     sizeof(labelFonts) / sizeof(labelFonts[0]),
-                     theme.muted,
-                     fillColor);
-
-    String unit = homeAssistantSlotUnit(slotIndex);
-    if (slot != nullptr && slot->hasData && unit.length() > 0) {
-        drawAdaptiveBadge(x + width - 52,
-                          y + 10,
-                          40,
-                          18,
-                          unit,
-                          unitFonts,
-                          sizeof(unitFonts) / sizeof(unitFonts[0]),
-                          theme.accentSoft,
-                          theme.accent);
-    }
-
-    String stateText = "Waiting";
-    uint16_t stateColor = theme.text;
-    if (slot != nullptr && slot->hasData) {
-        stateText = safeCString(slot->state);
-        stateColor = slot->numeric ? theme.text : theme.accent;
-    } else if (!feedsHomeAssistantConfigured()) {
-        stateText = "Add";
-        stateColor = theme.muted;
-    } else if (!homeAssistantSlotConfigured(slotIndex)) {
-        stateText = "Off";
-        stateColor = theme.muted;
-    } else if (!homeAssistantWaitingForSync()) {
-        stateText = "No data";
-        stateColor = theme.muted;
-    }
-
-    drawAdaptiveText(stateText,
-                     x + (width / 2),
-                     stateY,
-                     width - 20,
-                     TC_DATUM,
-                     valueFonts,
-                     sizeof(valueFonts) / sizeof(valueFonts[0]),
-                     stateColor,
-                     fillColor);
-
-    if (slot != nullptr &&
-        slot->hasData &&
-        unit.length() > 0 &&
-        (!slot->numeric || tft.textWidth(stateText, FONT_TITLE) > width - 30)) {
-        drawAdaptiveText(unit,
-                         x + (width / 2),
-                         unitY,
-                         width - 22,
-                         TC_DATUM,
-                         unitFonts,
-                         sizeof(unitFonts) / sizeof(unitFonts[0]),
-                         theme.muted,
-                         fillColor);
-    }
-}
-
-void renderHomePage() {
-    const ThemePalette &theme = activeTheme();
-    if (!hasHomeAssistantContent()) {
-        if (homeAssistantWaitingForSync()) {
-            drawPlaceholder("Home", "Syncing Home Assistant.");
-            return;
-        }
-        drawPlaceholder("Home", "Add Home Assistant entities.");
-        return;
-    }
-
-    drawScreenChrome("Home");
-    drawRoundedPanel(8, 36, 224, 184, theme.surface, theme.surfaceAlt);
-
-    uint8_t slotIndexes[HOME_ASSISTANT_SLOT_COUNT] = {0};
-    uint8_t slotCount = 0;
-    for (uint8_t index = 0; index < HOME_ASSISTANT_SLOT_COUNT; ++index) {
-        if (homeAssistantSlotConfigured(index)) {
-            slotIndexes[slotCount++] = index;
-        }
-    }
-
-    if (slotCount == 0) {
-        drawWrappedCenteredText("Add Home Assistant entities.", 120, 114, 188, FONT_LABEL, theme.muted, theme.surface, 2);
-        return;
-    }
-
-    if (slotCount == 1) {
-        drawHomeAssistantCard(16, 48, 208, 160, slotIndexes[0], theme.surfaceAlt, theme.surfaceAlt);
-        return;
-    }
-
-    if (slotCount == 2) {
-        drawHomeAssistantCard(16, 48, 208, 70, slotIndexes[0], theme.surfaceAlt, theme.surfaceAlt);
-        drawHomeAssistantCard(16, 134, 208, 70, slotIndexes[1], theme.surfaceAlt, theme.surfaceAlt);
-        return;
-    }
-
-    const int cardWidth = 100;
-    const int cardHeight = 80;
-    const int leftColumnX = 16;
-    const int rightColumnX = 124;
-    const int topRowY = 48;
-    const int bottomRowY = 136;
-
-    for (uint8_t displayIndex = 0; displayIndex < slotCount; ++displayIndex) {
-        int x = (displayIndex % 2 == 0) ? leftColumnX : rightColumnX;
-        int y = (displayIndex < 2) ? topRowY : bottomRowY;
-        drawHomeAssistantCard(x,
-                              y,
-                              cardWidth,
-                              cardHeight,
-                              slotIndexes[displayIndex],
-                              theme.surfaceAlt,
-                              theme.surfaceAlt);
-    }
-}
-
-void renderFocusPage() {
-    if (!hasFocusContent()) {
-        drawPlaceholder("Focus", "Set a timer when you need it.");
-        return;
-    }
-
-    const ThemePalette &theme = activeTheme();
-    drawScreenChrome("Focus");
-
-    drawRoundedPanel(8, 36, 224, 184, theme.surface, theme.surfaceAlt);
-    drawBadge(18, 48, 64, 20, dashboardData.focus.breakMode ? "Break" : "Focus", theme.accentSoft, theme.accent);
-
-    if (dashboardData.focus.running) {
-        drawBadge(166, 48, 54, 20, "Active", theme.positive, theme.background);
-    } else {
-        drawBadge(170, 48, 50, 20, "Ready", theme.surfaceAlt, theme.text);
-    }
-
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(FONT_INFO);
-    tft.setTextColor(theme.muted, theme.surface);
-    tft.drawString(dashboardData.focus.label[0] != '\0' ? dashboardData.focus.label : "Session",
-                   120, 76, FONT_INFO);
-
-    updateFocusDynamicArea();
-}
-
-void renderWorldPage() {
-    const ThemePalette &theme = activeTheme();
-    if (!hasWorldClockContent()) {
-        drawPlaceholder("World", "Add world clocks.");
-        return;
-    }
-
-    drawScreenChrome("World");
-    drawRoundedPanel(8, 36, 224, 184, theme.surface, theme.surfaceAlt);
-
-    int y = 52;
-    bool firstRow = true;
-    const int offsetFonts[] = {FONT_INFO};
-    for (uint8_t clockIndex = 0; clockIndex < DASHBOARD_WORLD_CLOCK_COUNT; ++clockIndex) {
-        const WorldClockData &clock = dashboardData.worldClocks[clockIndex];
-        if (!clock.enabled || clock.label[0] == '\0') {
-            continue;
-        }
-
-        if (!firstRow) {
-            drawDividerLine(20, y - 10, 184, theme.surfaceAlt);
-        }
-
-        tft.setTextDatum(TL_DATUM);
-        tft.setTextFont(FONT_INFO);
-        tft.setTextColor(theme.muted, theme.surface);
-        tft.drawString(clock.label, 20, y, FONT_INFO);
-
-        drawAdaptiveText(formatUtcOffset(clock.offsetSeconds),
-                         220,
-                         y,
-                         88,
-                         TR_DATUM,
-                         offsetFonts,
-                         sizeof(offsetFonts) / sizeof(offsetFonts[0]),
-                         theme.accent,
-                         theme.surface);
-        y += 72;
-        firstRow = false;
-    }
-
-    updateWorldDynamicArea();
-}
-
-void renderEventPage() {
-    const ThemePalette &theme = activeTheme();
-    if (!hasEventContent()) {
-        drawPlaceholder("Event", "Add a countdown.");
-        return;
-    }
-
-    drawScreenChrome("Event");
-    drawRoundedPanel(8, 36, 224, 184, theme.surface, theme.surfaceAlt);
-
-    drawWrappedCenteredText(dashboardData.event.title[0] != '\0' ? dashboardData.event.title : "Upcoming",
-                            120, 56, 186, FONT_BODY, theme.text, theme.surface, 2);
-    tft.fillRoundRect(104, 82, 32, 4, 2, theme.accentSoft);
-
-    updateEventDynamicArea();
-
-    if (dashboardData.event.subtitle[0] != '\0') {
-        drawWrappedCenteredText(dashboardData.event.subtitle,
-                                120,
-                                178,
-                                184,
-                                FONT_INFO,
-                                theme.muted,
-                                theme.surface,
-                                2);
-    }
-}
-
-void renderQuotePage() {
-    const ThemePalette &theme = activeTheme();
-    if (!hasQuoteContent()) {
-        drawPlaceholder("Quote", "Add a quote.");
-        return;
-    }
-
-    drawScreenChrome("Quote");
-    drawRoundedPanel(8, 36, 224, 184, theme.surface, theme.surfaceAlt);
-
-    tft.setTextDatum(TC_DATUM);
-    tft.fillRoundRect(100, 52, 40, 40, 20, theme.accentSoft);
-    tft.setTextFont(FONT_TITLE);
-    tft.setTextColor(theme.accent, theme.accentSoft);
-    tft.drawString("\"", 120, 60, FONT_TITLE);
-
-    drawWrappedCenteredText(safeCString(dashboardData.quote.text),
-                            120, 104, 186, FONT_LABEL, theme.text, theme.surface, 4);
-
-    if (dashboardData.quote.author[0] != '\0') {
-        int chipWidth = min(160, tft.textWidth(dashboardData.quote.author, FONT_INFO) + 20);
-        int chipX = 120 - (chipWidth / 2);
-        tft.fillRoundRect(chipX, 186, chipWidth, 20, 10, theme.accentSoft);
-        drawAdaptiveText(safeCString(dashboardData.quote.author),
-                         120,
-                         191,
-                         chipWidth - 14,
-                         MC_DATUM,
-                         nullptr,
-                         0,
-                         theme.accent,
-                         theme.accentSoft);
-    }
-}
-
-void renderStatusPage() {
-    const ThemePalette &theme = activeTheme();
-    if (!hasStatusContent()) {
-        drawPlaceholder("Status", "Add status lines.");
-        return;
-    }
-
-    drawScreenChrome("Status");
-
-    drawRoundedPanel(8, 36, 224, 184, theme.surface, theme.surfaceAlt);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(FONT_TITLE);
-    tft.setTextColor(theme.text, theme.surface);
-    drawWrappedCenteredText(dashboardData.status.line1[0] != '\0' ? dashboardData.status.line1 : "Status line 1",
-                            120, 74, 184, FONT_BODY, theme.text, theme.surface, 2);
-
-    drawDividerLine(28, 132, 184, theme.surfaceAlt);
-    drawWrappedCenteredText(dashboardData.status.line2[0] != '\0' ? dashboardData.status.line2 : "Status line 2",
-                            120, 150, 184, FONT_LABEL, theme.muted, theme.surface, 2);
+                     actorFonts,
+                     sizeof(actorFonts) / sizeof(actorFonts[0]),
+                     accent,
+                     theme.background);
 }
 
 void renderDashboardPage() {
@@ -1994,26 +1835,11 @@ void renderDashboardPage() {
         case DASHBOARD_PAGE_WEATHER:
             renderWeatherPage();
             break;
-        case DASHBOARD_PAGE_MARKETS:
-            renderMarketsPage();
+        case DASHBOARD_PAGE_RIVER:
+            renderRiverPage();
             break;
-        case DASHBOARD_PAGE_HOME:
-            renderHomePage();
-            break;
-        case DASHBOARD_PAGE_FOCUS:
-            renderFocusPage();
-            break;
-        case DASHBOARD_PAGE_WORLD:
-            renderWorldPage();
-            break;
-        case DASHBOARD_PAGE_EVENT:
-            renderEventPage();
-            break;
-        case DASHBOARD_PAGE_QUOTE:
-            renderQuotePage();
-            break;
-        case DASHBOARD_PAGE_STATUS:
-            renderStatusPage();
+        case DASHBOARD_PAGE_GITHUB:
+            renderGithubPage();
             break;
         default:
             renderClockPage();
@@ -2026,14 +1852,8 @@ void updateDashboardDynamicArea(uint8_t pageId) {
         case DASHBOARD_PAGE_CLOCK:
             updateClockDynamicArea();
             break;
-        case DASHBOARD_PAGE_FOCUS:
-            updateFocusDynamicArea();
-            break;
-        case DASHBOARD_PAGE_WORLD:
-            updateWorldDynamicArea();
-            break;
-        case DASHBOARD_PAGE_EVENT:
-            updateEventDynamicArea();
+        case DASHBOARD_PAGE_RIVER:
+            updateRiverDynamicArea();
             break;
         default:
             break;
@@ -2168,12 +1988,25 @@ void displayInit() {
 
     tft.init();
     tft.setRotation(0);
+
+    // Shadow-crushed gamma. This is a backlit LCD, so near-black lifts into grey
+    // (backlight haze). Lowering the low-grey points of the ST7789 gamma curve
+    // pulls the dark end down toward the panel floor while leaving midtones and
+    // highlights near stock. Only the first few params differ from the default
+    // curve; delete these two writes to return to stock gamma.
+    {
+        static const uint8_t kGammaPos[14] =
+            {0xD0, 0x00, 0x05, 0x08, 0x0B, 0x28, 0x3F, 0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23};
+        static const uint8_t kGammaNeg[14] =
+            {0xD0, 0x00, 0x05, 0x08, 0x0B, 0x29, 0x3F, 0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23};
+        tft.writecommand(0xE0);  // GMCTRP1 - positive gamma
+        for (uint8_t i = 0; i < 14; ++i) tft.writedata(kGammaPos[i]);
+        tft.writecommand(0xE1);  // GMCTRN1 - negative gamma
+        for (uint8_t i = 0; i < 14; ++i) tft.writedata(kGammaNeg[i]);
+    }
+
     tft.invertDisplay(true);
     tft.fillScreen(TFT_BLACK);
-
-    TJpgDec.setJpgScale(1);
-    TJpgDec.setSwapBytes(true);
-    TJpgDec.setCallback(tftOutput);
 
     displayState.line2[0] = '\0';
     displayState.ipInfo[0] = '\0';
@@ -2286,27 +2119,6 @@ void displayUpdate() {
         invalidateRenderCache();
     }
 
-    if (displayState.showImage && displayState.imagePath[0] != '\0') {
-        if (renderCache.valid &&
-            renderCache.mode == DISPLAY_MODE_IMAGE &&
-            strcmp(renderCache.imagePath, displayState.imagePath) == 0) {
-            return;
-        }
-
-        displayRenderImage(displayState.imagePath);
-        if (LittleFS.exists(displayState.imagePath)) {
-            renderCache.valid = true;
-            renderCache.mode = DISPLAY_MODE_IMAGE;
-            renderCache.page = 0;
-            renderCache.theme = activeThemeIdValue();
-            renderCache.staticHash = 0;
-            renderCache.dynamicHash = 0;
-            strncpy(renderCache.imagePath, displayState.imagePath, sizeof(renderCache.imagePath) - 1);
-            renderCache.imagePath[sizeof(renderCache.imagePath) - 1] = '\0';
-        }
-        return;
-    }
-
     if (displayState.apMode) {
         uint32_t currentHash = apScreenHash();
         uint8_t themeId = activeThemeIdValue();
@@ -2349,15 +2161,15 @@ void displayRenderAPMode() {
     tft.fillRoundRect(10, 10, 220, 24, 12, theme.surfaceAlt);
     tft.fillCircle(24, 22, 4, theme.accent);
     tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(FONT_INFO);
+    loadMono(13);
     tft.setTextColor(theme.text, theme.surfaceAlt);
-    tft.drawString("Setup mode", 36, 16, FONT_INFO);
+    tft.drawString("Setup mode", 36, 16);
 
     drawRoundedPanel(10, 42, 220, 60, theme.accentSoft, theme.accentSoft);
     tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(FONT_INFO);
+    loadMono(13);
     tft.setTextColor(theme.accent, theme.accentSoft);
-    tft.drawString("SETUP URL", 120, 52, FONT_INFO);
+    tft.drawString("SETUP URL", 120, 52);
     drawAdaptiveText(setupIp,
                      120,
                      68,
@@ -2367,15 +2179,15 @@ void displayRenderAPMode() {
                      sizeof(kIpFonts) / sizeof(kIpFonts[0]),
                      theme.text,
                      theme.accentSoft);
-    tft.setTextFont(FONT_INFO);
+    loadMono(13);
     tft.setTextColor(theme.muted, theme.accentSoft);
-    tft.drawString("Open this in browser", 120, 86, FONT_INFO);
+    tft.drawString("Open this in browser", 120, 86);
 
     drawRoundedPanel(10, 108, 134, 50, theme.surface, theme.surfaceAlt);
     tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(FONT_INFO);
+    loadMono(13);
     tft.setTextColor(theme.muted, theme.surface);
-    tft.drawString("WI-FI", 20, 118, FONT_INFO);
+    tft.drawString("WI-FI", 20, 118);
     drawAdaptiveText(safeCString(displayState.apSSID),
                      77,
                      136,
@@ -2388,9 +2200,9 @@ void displayRenderAPMode() {
 
     drawRoundedPanel(150, 108, 80, 50, theme.surface, theme.surfaceAlt);
     tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(FONT_INFO);
+    loadMono(13);
     tft.setTextColor(theme.muted, theme.surface);
-    tft.drawString("PASS", 190, 118, FONT_INFO);
+    tft.drawString("PASS", 190, 118);
     drawAdaptiveText(safeCString(displayState.apPassword),
                      190,
                      136,
@@ -2403,9 +2215,9 @@ void displayRenderAPMode() {
 
     drawRoundedPanel(10, 168, 220, 62, theme.surfaceAlt, theme.surfaceAlt);
     tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(FONT_INFO);
+    loadMono(13);
     tft.setTextColor(canRevealAdminPassword ? theme.accent : theme.muted, theme.surfaceAlt);
-    tft.drawString("ADMIN LOGIN", 20, 178, FONT_INFO);
+    tft.drawString("ADMIN LOGIN", 20, 178);
 
     if (canRevealAdminPassword && adminPassword != nullptr && adminPassword[0] != '\0') {
         drawBadge(20, 193, 48, 18, "admin", theme.accentSoft, theme.accent);
@@ -2420,9 +2232,9 @@ void displayRenderAPMode() {
                          theme.surfaceAlt);
 
         tft.setTextDatum(TL_DATUM);
-        tft.setTextFont(FONT_INFO);
+        loadMono(13);
         tft.setTextColor(theme.muted, theme.surfaceAlt);
-        tft.drawString("Use this password on the dashboard.", 20, 212, FONT_INFO);
+        tft.drawString("Log in with this password.", 20, 212);
         return;
     }
 
@@ -2441,28 +2253,6 @@ void displayBlankScreen() {
     tft.fillScreen(TFT_BLACK);
     invalidateRenderCache();
     logPrint(F("Display blanked to black."));
-}
-
-void displayRenderImage(const char *path) {
-    if (!LittleFS.exists(path)) {
-        displayShowMessage(F("Image not found"));
-        return;
-    }
-
-    File jpgFile = LittleFS.open(path, "r");
-    if (!jpgFile) {
-        displayShowMessage(String(F("Failed to open\n")) + path);
-        return;
-    }
-
-    tft.startWrite();
-    JRESULT result = TJpgDec.drawFsJpg(0, 0, jpgFile);
-    tft.endWrite();
-    jpgFile.close();
-
-    if (result != JDR_OK) {
-        displayShowMessage(String(F("JPEG error\n")) + String(result));
-    }
 }
 
 void displayShowMessage(const String &msg) {
@@ -2524,6 +2314,12 @@ void displayCycleNextPage(bool smoothTransition) {
 
     if (displayState.currentPage == previousPage) {
         return;
+    }
+
+    // Each visit to the GitHub page shows the next cached event rather than
+    // repeating the newest one until the feed refreshes.
+    if (displayState.currentPage == DASHBOARD_PAGE_GITHUB) {
+        feedsGithubAdvanceCursor();
     }
 
     int targetBrightness = appliedBrightness;

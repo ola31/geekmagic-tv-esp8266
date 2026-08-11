@@ -5,25 +5,13 @@
 #include "dashboard.h"
 
 #define FEEDS_CONFIG_PATH "/feeds-config.json"
-#define FEEDS_CONFIG_VERSION 2
-#define HOME_ASSISTANT_SLOT_COUNT 4
+#define FEEDS_CONFIG_VERSION 4
+#define GITHUB_REPO_SLOT_COUNT 4
 
 enum WeatherFeedSource : uint8_t {
     WEATHER_FEED_DISABLED = 0,
     WEATHER_FEED_MANUAL,
     WEATHER_FEED_OPEN_METEO
-};
-
-enum MarketFeedSource : uint8_t {
-    MARKET_FEED_DISABLED = 0,
-    MARKET_FEED_MANUAL,
-    MARKET_FEED_FINNHUB,
-    MARKET_FEED_COINGECKO
-};
-
-enum HomeAssistantTlsMode : uint8_t {
-    HOME_ASSISTANT_TLS_INSECURE = 0,
-    HOME_ASSISTANT_TLS_FINGERPRINT
 };
 
 struct WeatherFeedConfig {
@@ -36,37 +24,32 @@ struct WeatherFeedConfig {
     bool useFahrenheit;
 };
 
-struct MarketFeedConfig {
-    uint8_t source;
-    char symbol[24];
-    char label[16];
-    char currency[8];
+// Seoul Open Data Plaza publishes hourly readings from the automatic water
+// quality stations on the Han River and its tributaries. The "sample" key works
+// without registration but is capped at five rows.
+struct RiverFeedConfig {
+    bool enabled;
+    char apiKey[40];
+    char station[24];   // preferred station name as the API spells it (UTF-8)
     uint16_t refreshMinutes;
 };
 
-struct HomeAssistantSlotConfig {
+// The global api.github.com/events feed only carries PushEvent entries from
+// throwaway repositories, so watching a handful of well-known repositories
+// gives far better content. useGlobalFeed switches back to the firehose.
+struct GithubFeedConfig {
     bool enabled;
-    char entityId[72];
-    char label[24];
-    char unit[12];
-};
-
-struct HomeAssistantConfig {
-    bool enabled;
-    char baseUrl[128];
-    char token[224];
-    uint8_t tlsMode;
-    char fingerprint[41];
+    bool useGlobalFeed;
+    char token[64];     // optional; raises the rate limit from 60 to 5000/hour
+    char repos[GITHUB_REPO_SLOT_COUNT][40];
     uint16_t refreshMinutes;
-    HomeAssistantSlotConfig slots[HOME_ASSISTANT_SLOT_COUNT];
 };
 
 struct FeedConfig {
     uint16_t version;
-    char finnhubApiKey[48];
     WeatherFeedConfig weather;
-    MarketFeedConfig markets[DASHBOARD_MARKET_COUNT];
-    HomeAssistantConfig homeAssistant;
+    RiverFeedConfig river;
+    GithubFeedConfig github;
 };
 
 struct WeatherFeedRuntime {
@@ -78,38 +61,29 @@ struct WeatherFeedRuntime {
     WeatherData data;
 };
 
-struct MarketFeedRuntime {
+struct RiverFeedRuntime {
     bool hasData;
     bool syncing;
     uint32_t lastAttemptMs;
     uint32_t lastSuccessMs;
     char lastError[64];
-    MarketData data;
+    RiverData data;
 };
 
-struct HomeAssistantSlotData {
-    bool enabled;
-    bool hasData;
-    bool numeric;
-    char entityId[72];
-    char label[24];
-    char state[24];
-    char unit[12];
-};
-
-struct HomeAssistantRuntime {
+struct GithubFeedRuntime {
     bool hasData;
     bool syncing;
     uint32_t lastAttemptMs;
     uint32_t lastSuccessMs;
+    uint8_t nextRepoIndex;   // rotates through the configured repositories
     char lastError[64];
-    HomeAssistantSlotData slots[HOME_ASSISTANT_SLOT_COUNT];
+    GithubData data;
 };
 
 struct FeedRuntimeState {
     WeatherFeedRuntime weather;
-    MarketFeedRuntime markets[DASHBOARD_MARKET_COUNT];
-    HomeAssistantRuntime homeAssistant;
+    RiverFeedRuntime river;
+    GithubFeedRuntime github;
 };
 
 extern FeedConfig feedConfig;
@@ -129,16 +103,17 @@ bool feedsSyncNow(const char *scope = "all", String *error = nullptr);
 bool feedsSearchWeatherLocations(const String &query, String &json, String *error = nullptr);
 
 uint8_t feedsWeatherSource();
-uint8_t feedsMarketSource(uint8_t index);
-bool feedsHomeAssistantConfigured();
-bool feedsHasHomeAssistantData();
-const HomeAssistantSlotData* feedsHomeAssistantSlotData(uint8_t index);
 bool feedsWeatherConfigured();
-bool feedsMarketConfigured(uint8_t index);
 bool feedsHasWeatherData();
-bool feedsHasMarketData(uint8_t index);
 bool feedsWeatherUsesFahrenheit();
 const WeatherData* feedsWeatherData();
-const MarketData* feedsMarketData(uint8_t index);
+
+bool feedsRiverConfigured();
+bool feedsHasRiverData();
+const RiverData* feedsRiverData();
+bool feedsGithubConfigured();
+bool feedsHasGithubData();
+const GithubData* feedsGithubData();
+void feedsGithubAdvanceCursor();
 
 #endif

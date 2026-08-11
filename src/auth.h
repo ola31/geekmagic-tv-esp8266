@@ -5,7 +5,7 @@
 
 #define AUTH_CONFIG_PATH "/auth.json"
 #define AUTH_CONFIG_VERSION 2
-#define AUTH_MIN_PASSWORD_LENGTH 8
+#define AUTH_MIN_PASSWORD_LENGTH 4
 #define AUTH_MAX_PASSWORD_LENGTH 32
 
 void authInit();

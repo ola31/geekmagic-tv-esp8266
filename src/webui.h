@@ -1133,13 +1133,8 @@ input[type="submit"]:disabled,
                     <div class="chip-grid">
                         <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageClock"><span>Clock</span></label>
                         <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageWeather"><span>Weather</span></label>
-                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageMarkets"><span>Markets</span></label>
-                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageHome"><span>Home Assistant</span></label>
-                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageFocus"><span>Focus</span></label>
-                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageWorld"><span>World</span></label>
-                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageEvent"><span>Event</span></label>
-                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageQuote"><span>Quote</span></label>
-                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageStatus"><span>Status</span></label>
+                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageRiver"><span>Han River</span></label>
+                        <label class="chip-toggle"><input data-live data-page-toggle type="checkbox" id="pageGithub"><span>GitHub</span></label>
                     </div>
                 </section>
 
@@ -1331,23 +1326,85 @@ input[type="submit"]:disabled,
                 </div>
 
             </section>
+            <section class="panel">
+                <div class="panel-header">
+                    <h2 class="panel-title">Han River</h2>
+                </div>
+
+                <div class="grid two">
+                    <div class="field">
+                        <label for="riverStation">Station</label>
+                        <input data-feed-live type="text" id="riverStation" placeholder="선유">
+                        <small>Name as the Seoul API spells it: 선유, 노량진, 탄천, 중랑천, 안양천.</small>
+                    </div>
+                    <div class="field">
+                        <label for="riverRefresh">Refresh</label>
+                        <input data-feed-live type="number" id="riverRefresh" min="5" max="240">
+                    </div>
+                </div>
+
+                <div class="field" style="margin-top: 14px;">
+                    <label for="riverApiKey">Seoul Open Data key</label>
+                    <input data-feed-live type="text" id="riverApiKey" placeholder="sample">
+                    <small>"sample" works but is capped at five rows. A free key from data.seoul.go.kr is steadier.</small>
+                </div>
+
+                <div class="toggle-grid" style="margin-top: 14px;">
+                    <label class="toggle"><span>Enabled</span><input data-feed-live type="checkbox" id="riverEnabled"></label>
+                </div>
+
+                <div class="button-row" style="margin-top: 14px;">
+                    <button type="button" class="ghost" onclick="syncFeeds('river')">Sync river</button>
+                </div>
+            </section>
 
             <section class="panel">
                 <div class="panel-header">
-                    <h2 class="panel-title">Providers</h2>
+                    <h2 class="panel-title">GitHub</h2>
                 </div>
 
-                <div class="field">
-                    <label for="finnhubApiKey">Finnhub API key</label>
-                    <input data-feed-live type="password" id="finnhubApiKey" placeholder="Free key for stocks">
-                    <small>Needed for Finnhub stock slots. Open-Meteo weather and CoinGecko crypto are keyless.</small>
+                <div class="panel-note">One entry is read per refresh, cycling through the list. Use <code>owner/repo</code> for a single repository, or a bare organisation name such as <code>rust-lang</code> to follow everything it owns.</div>
+
+                <div class="grid two" style="margin-top: 12px;">
+                    <div class="field"><label for="githubRepo0">Source 1</label><input data-feed-live type="text" id="githubRepo0" placeholder="robotis-git"></div>
+                    <div class="field"><label for="githubRepo1">Source 2</label><input data-feed-live type="text" id="githubRepo1" placeholder="ros2"></div>
+                </div>
+                <div class="grid two">
+                    <div class="field"><label for="githubRepo2">Source 3</label><input data-feed-live type="text" id="githubRepo2" placeholder="asahilinux"></div>
+                    <div class="field"><label for="githubRepo3">Source 4</label><input data-feed-live type="text" id="githubRepo3" placeholder="nvidia"></div>
                 </div>
 
-                <div class="status-list" style="margin-top: 14px;">
+                <div class="grid two" style="margin-top: 8px;">
+                    <div class="field">
+                        <label for="githubRefresh">Refresh</label>
+                        <input data-feed-live type="number" id="githubRefresh" min="2" max="240">
+                    </div>
+                    <div class="field">
+                        <label for="githubToken">Token</label>
+                        <input data-feed-live type="password" id="githubToken" placeholder="optional">
+                        <small>Without one GitHub allows 60 requests an hour.</small>
+                    </div>
+                </div>
+
+                <div class="toggle-grid" style="margin-top: 14px;">
+                    <label class="toggle"><span>Enabled</span><input data-feed-live type="checkbox" id="githubEnabled"></label>
+                    <label class="toggle"><span>Global feed</span><input data-feed-live type="checkbox" id="githubUseGlobalFeed"></label>
+                </div>
+
+                <div class="button-row" style="margin-top: 14px;">
+                    <button type="button" class="ghost" onclick="syncFeeds('github')">Sync GitHub</button>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-header">
+                    <h2 class="panel-title">Status</h2>
+                </div>
+
+                <div class="status-list">
                     <div class="status-item"><span>Weather</span><span id="weatherFeedStatus">--</span></div>
-                    <div class="status-item"><span>Market 1</span><span id="marketFeedStatus0">--</span></div>
-                    <div class="status-item"><span>Market 2</span><span id="marketFeedStatus1">--</span></div>
-                    <div class="status-item"><span>Market 3</span><span id="marketFeedStatus2">--</span></div>
+                    <div class="status-item"><span>Han River</span><span id="riverFeedStatus">--</span></div>
+                    <div class="status-item"><span>GitHub</span><span id="githubFeedStatus">--</span></div>
                 </div>
 
                 <div class="button-row" style="margin-top: 14px;">
@@ -1902,13 +1959,8 @@ const defaultNightCustomTheme = {
 const dashboardPageControls = [
     { key: "clock", id: "pageClock" },
     { key: "weather", id: "pageWeather" },
-    { key: "markets", id: "pageMarkets" },
-    { key: "home", id: "pageHome" },
-    { key: "focus", id: "pageFocus" },
-    { key: "world", id: "pageWorld" },
-    { key: "event", id: "pageEvent" },
-    { key: "quote", id: "pageQuote" },
-    { key: "status", id: "pageStatus" }
+    { key: "river", id: "pageRiver" },
+    { key: "github", id: "pageGithub" }
 ];
 
 let hydrating = false;
@@ -2057,7 +2109,7 @@ function updateAuthGuidance() {
 
     document.getElementById("authHint").textContent = "Sign in to manage the device.";
     setupNote.innerHTML = "<strong>First install or reset</strong>Connect to <code>SmartClock-Setup</code> and open <code>192.168.4.1</code>. New devices provisioned by this firmware can reveal the generated setup password from this page.";
-    recoveryNote.innerHTML = "<strong>Forgot a password?</strong>Custom or older passwords cannot be displayed because only a secure hash is stored. Use 5 quick power cycles to factory reset, then sign in with the new generated setup password.";
+    recoveryNote.innerHTML = "<strong>Forgot a password?</strong>Custom or older passwords cannot be displayed because only a secure hash is stored. Use 10 quick power cycles to factory reset, then sign in with the new generated setup password.";
 }
 
 function setAuthenticatedState(nextState) {
@@ -2087,8 +2139,23 @@ function handleUnauthorized(message = "Sign in to continue.") {
     updateActionButtons();
 }
 
+// The ESP8266 serves one request at a time, so a request landing while it is
+// busy (rendering, fetching a feed) can hang. Browser fetch has no timeout, so
+// without this a hung request would stall forever - which is what left the
+// login popup stuck on "Loading...". Abort after a few seconds so callers (and
+// the retry loop) can recover.
+async function fetchWithTimeout(url, options = {}, ms = 8000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function request(url, options = {}) {
-    const response = await fetch(url, options);
+    const response = await fetchWithTimeout(url, options);
     if (response.status === 401 && url !== "/auth/login" && url !== "/auth/status") {
         handleUnauthorized("Session expired. Sign in again.");
     }
@@ -2104,7 +2171,7 @@ async function postJson(url, body) {
 }
 
 async function refreshAuthStatus() {
-    const response = await fetch("/auth/status");
+    const response = await fetchWithTimeout("/auth/status");
     if (!response.ok) {
         throw new Error("Auth status failed");
     }
@@ -2257,7 +2324,6 @@ function readEnabledPages() {
         pages[key] = document.getElementById(id).checked;
     });
     ensurePageSelection();
-    pages.clock = document.getElementById("pageClock").checked;
     return pages;
 }
 
@@ -2683,16 +2749,13 @@ function feedStatusText(source, status, fallbackText) {
 
 function applyFeedState(feedState) {
     const config = feedState.config || {};
-    const providers = config.providers || {};
     const weather = config.weather || {};
-    const markets = config.markets || [];
-    const homeAssistant = config.homeAssistant || {};
+    const river = config.river || {};
+    const github = config.github || {};
     const status = feedState.status || {};
     const weatherStatus = status.weather || {};
-    const marketStatuses = status.markets || [];
-    const homeAssistantStatus = status.homeAssistant || {};
-
-    setValue("finnhubApiKey", providers.finnhubApiKey || "");
+    const riverStatus = status.river || {};
+    const githubStatus = status.github || {};
 
     const weatherSource = normalizeWeatherSourceForUI(weather.source || "disabled");
     setValue("weatherSource", weatherSource);
@@ -2704,73 +2767,39 @@ function applyFeedState(feedState) {
     setChecked("weatherUseFahrenheit", weather.useFahrenheit);
     updateWeatherModeUI();
 
-    document.getElementById("weatherFeedStatus").textContent = feedStatusText(
-        weatherSource,
-        weatherStatus,
-        "Waiting"
-    );
-
+    document.getElementById("weatherFeedStatus").textContent = feedStatusText(weatherSource, weatherStatus, "Waiting");
     if (weatherStatus?.hasData && weatherStatus.data) {
         const label = weatherStatus.data.location || weather.label || weather.query || "Weather";
-        document.getElementById("weatherFeedBadge").textContent = label;
-    }
-
-    for (let index = 0; index < 3; index += 1) {
-        const market = markets[index] || {};
-        const marketStatus = marketStatuses[index] || {};
-        const marketSource = normalizeMarketSourceForUI(market.source || "disabled");
-
-        setValue(`marketSource${index}`, marketSource);
-        setValue(`feedMarketSymbol${index}`, market.symbol || "");
-        setValue(`feedMarketLabel${index}`, market.label || "");
-        setValue(`feedMarketCurrency${index}`, market.currency || "usd");
-        setValue(`feedMarketRefresh${index}`, market.refreshMinutes ?? 10);
-        updateMarketModeUI(index);
-
-        document.getElementById(`marketFeedStatus${index}`).textContent = feedStatusText(
-            marketSource,
-            marketStatus,
-            "Waiting"
-        );
-    }
-
-    setChecked("homeAssistantEnabled", homeAssistant.enabled);
-    setValue("homeAssistantBaseUrl", homeAssistant.baseUrl || "");
-    setValue("homeAssistantToken", homeAssistant.token || "");
-    setValue("homeAssistantTlsMode", normalizeHomeAssistantTlsMode(homeAssistant.tlsMode || "insecure"));
-    setValue("homeAssistantFingerprint", homeAssistant.fingerprint || "");
-    setValue("homeAssistantRefresh", homeAssistant.refreshMinutes ?? 2);
-
-    const homeSlots = homeAssistant.slots || [];
-    const homeSlotStatuses = homeAssistantStatus.slots || [];
-    for (let index = 0; index < 4; index += 1) {
-        const slot = homeSlots[index] || {};
-        const slotStatus = homeSlotStatuses[index] || {};
-        setChecked(`haEnabled${index}`, slot.enabled);
-        setValue(`haEntityId${index}`, slot.entityId || "");
-        setValue(`haLabel${index}`, slot.label || "");
-        setValue(`haUnit${index}`, slot.unit || "");
-
-        if (!homeAssistant.enabled) {
-            document.getElementById(`haSlotMeta${index}`).textContent = "Disabled";
-        } else if (!slot.enabled) {
-            document.getElementById(`haSlotMeta${index}`).textContent = "Off";
-        } else if (slotStatus?.hasData) {
-            const stateLabel = [slotStatus.state, slotStatus.unit].filter(Boolean).join(" ");
-            document.getElementById(`haSlotMeta${index}`).textContent = stateLabel || "Ready";
-        } else if (slotStatus?.lastError) {
-            document.getElementById(`haSlotMeta${index}`).textContent = slotStatus.lastError;
-        } else {
-            document.getElementById(`haSlotMeta${index}`).textContent = slot.entityId || "Waiting";
+        const badge = document.getElementById("weatherFeedBadge");
+        if (badge) {
+            badge.textContent = label;
         }
     }
 
-    updateHomeAssistantModeUI();
-    document.getElementById("homeAssistantFeedStatus").textContent = feedStatusText(
-        homeAssistant.enabled ? "home" : "disabled",
-        homeAssistantStatus,
-        "Waiting"
-    );
+    setChecked("riverEnabled", river.enabled);
+    setValue("riverApiKey", river.apiKey || "");
+    setValue("riverStation", river.station || "");
+    setValue("riverRefresh", river.refreshMinutes ?? 20);
+    document.getElementById("riverFeedStatus").textContent =
+        riverStatus.hasData && riverStatus.data
+            ? `${riverStatus.data.station} ${riverStatus.data.temperature}\u00B0C`
+            : (riverStatus.lastError || (river.enabled ? "Waiting" : "Off"));
+
+    setChecked("githubEnabled", github.enabled);
+    setChecked("githubUseGlobalFeed", github.useGlobalFeed);
+    setValue("githubToken", github.token || "");
+    setValue("githubRefresh", github.refreshMinutes ?? 2);
+    const repos = github.repos || [];
+    for (let index = 0; index < 4; index += 1) {
+        setValue(`githubRepo${index}`, repos[index] || "");
+    }
+    const githubEvent = (githubStatus.events || [])[0];
+    document.getElementById("githubFeedStatus").textContent = githubEvent
+        ? `${githubEvent.kind} ${githubEvent.repo}`
+        : (githubStatus.lastError || (github.enabled ? "Waiting" : "Off"));
+
+    feedDirty = Boolean(feedState.meta?.hasDraft);
+    updateFeedDirtyState();
 }
 
 function buildSettingsPayload() {
@@ -2851,9 +2880,6 @@ function buildWidgetPayload() {
 
 function buildFeedPayload() {
     return {
-        providers: {
-            finnhubApiKey: document.getElementById("finnhubApiKey").value.trim()
-        },
         weather: {
             source: document.getElementById("weatherSource").value,
             query: document.getElementById("weatherQuery").value.trim(),
@@ -2863,26 +2889,18 @@ function buildFeedPayload() {
             refreshMinutes: readInt("weatherRefresh", 30),
             useFahrenheit: document.getElementById("weatherUseFahrenheit").checked
         },
-        markets: [0, 1, 2].map((index) => ({
-            source: document.getElementById(`marketSource${index}`).value,
-            symbol: document.getElementById(`feedMarketSymbol${index}`).value.trim(),
-            label: document.getElementById(`feedMarketLabel${index}`).value.trim(),
-            currency: document.getElementById(`feedMarketCurrency${index}`).value.trim().toLowerCase(),
-            refreshMinutes: readInt(`feedMarketRefresh${index}`, 10)
-        })),
-        homeAssistant: {
-            enabled: document.getElementById("homeAssistantEnabled").checked,
-            baseUrl: document.getElementById("homeAssistantBaseUrl").value.trim(),
-            token: document.getElementById("homeAssistantToken").value.trim(),
-            tlsMode: document.getElementById("homeAssistantTlsMode").value,
-            fingerprint: document.getElementById("homeAssistantFingerprint").value.trim(),
-            refreshMinutes: readInt("homeAssistantRefresh", 2),
-            slots: [0, 1, 2, 3].map((index) => ({
-                enabled: document.getElementById(`haEnabled${index}`).checked,
-                entityId: document.getElementById(`haEntityId${index}`).value.trim(),
-                label: document.getElementById(`haLabel${index}`).value.trim(),
-                unit: document.getElementById(`haUnit${index}`).value.trim()
-            }))
+        river: {
+            enabled: document.getElementById("riverEnabled").checked,
+            apiKey: document.getElementById("riverApiKey").value.trim(),
+            station: document.getElementById("riverStation").value.trim(),
+            refreshMinutes: readInt("riverRefresh", 20)
+        },
+        github: {
+            enabled: document.getElementById("githubEnabled").checked,
+            useGlobalFeed: document.getElementById("githubUseGlobalFeed").checked,
+            token: document.getElementById("githubToken").value.trim(),
+            refreshMinutes: readInt("githubRefresh", 2),
+            repos: [0, 1, 2, 3].map((index) => document.getElementById(`githubRepo${index}`).value.trim())
         }
     };
 }
@@ -3545,23 +3563,20 @@ async function loadAllState() {
     feedLiveTimer = 0;
 
     try {
-        const [appResponse, dashboardResponse, feedsResponse, versionResponse, spaceResponse] = await Promise.all([
-            request("/app.json"),
-            request("/dashboard.json"),
-            request("/feeds.json"),
-            request("/version.json"),
-            request("/space.json")
-        ]);
-
-        if (!appResponse.ok || !dashboardResponse.ok || !feedsResponse.ok || !versionResponse.ok || !spaceResponse.ok) {
+        // One round trip for the whole initial state. This device serves a
+        // single connection at a time, so five concurrent fetches used to
+        // serialise on it - and on a weak link one stalled request held up the
+        // entire page. See handleStateJson.
+        const stateResponse = await request("/state.json");
+        if (!stateResponse.ok) {
             throw new Error("State request failed");
         }
-
-        const appState = await appResponse.json();
-        const dashboardState = await dashboardResponse.json();
-        const feedsState = await feedsResponse.json();
-        const versionState = await versionResponse.json();
-        const spaceState = await spaceResponse.json();
+        const state = await stateResponse.json();
+        const appState = state.app;
+        const dashboardState = state.dashboard;
+        const feedsState = state.feeds;
+        const versionState = state.version;
+        const spaceState = state.space;
 
         applyAppState(appState);
         applyDashboardState(dashboardState);
@@ -3773,19 +3788,33 @@ window.addEventListener("load", () => {
                 ? "Search or sync to resolve this city."
                 : "Enter at least 2 characters.";
     });
-    refreshAuthStatus()
-        .then(() => {
-            if (authenticated) {
-                return loadAllState();
+    (async () => {
+        // Retry the first status fetch: on a weak link the very first request
+        // often fails, and without this the login popup was left showing
+        // "Loading..." until some later request happened to succeed.
+        let ok = false;
+        for (let attempt = 0; attempt < 5 && !ok; attempt++) {
+            try {
+                await refreshAuthStatus();
+                ok = true;
+            } catch (error) {
+                console.error(error);
+                if (attempt < 4) {
+                    await new Promise((resolve) => setTimeout(resolve, 700));
+                }
             }
-            setSyncState("Locked", "error");
-            return undefined;
-        })
-        .catch((error) => {
-            console.error(error);
+        }
+        if (!ok) {
             showAuthOverlay("Unable to reach the device.", "error");
             setSyncState("Auth failed", "error");
-        });
+            return;
+        }
+        if (authenticated) {
+            await loadAllState();
+        } else {
+            setSyncState("Locked", "error");
+        }
+    })();
 });
 </script>
 </body>
