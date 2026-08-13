@@ -4,6 +4,15 @@ Custom ESP8266 firmware for GeekMagic SmallTV-style smart weather clocks with a 
 
 The project has been tested on the GeekMagic SmallTV Ultra ESP8266 variant. Other ESP8266-based variants may require pin or build-flag changes. The ESP32-based SmallTV Pro is not a target for this repository.
 
+<p align="center">
+  <img src="assets/smalltv-clock.jpg" width="23%" alt="SmallTV Ultra clock page">
+  <img src="assets/smalltv-weather.jpg" width="23%" alt="SmallTV Ultra Seoul weather page">
+  <img src="assets/smalltv-river.jpg" width="23%" alt="SmallTV Ultra Han River water-temperature page">
+  <img src="assets/smalltv-github.jpg" width="23%" alt="SmallTV Ultra GitHub events page">
+</p>
+
+<p align="center"><sub>Time · Weather · Han River · GitHub</sub></p>
+
 ## For Humans
 
 Strongly recommended: **let an LLM agent install this for you.** Getting this
@@ -269,14 +278,6 @@ curl -b cookies.txt -F "firmware=@$FW;filename=firmware.bin" \
 <!-- ============================================================= -->
 <!-- End of agent guide. Human reference follows.                  -->
 <!-- ============================================================= -->
-
-## Screenshots
-
-![Device display examples](assets/device-display.jpg)
-
-![Dashboard feeds configuration](assets/dashboard-feeds.jpg)
-
-![Dashboard display configuration](assets/dashboard-display.jpg)
 
 ## Features
 
